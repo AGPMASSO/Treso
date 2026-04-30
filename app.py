@@ -9,6 +9,16 @@ DB_PATH = "agpm.db"
 MONTHLY_CONTRIBUTION = 10.0
 
 
+def member_ref(member_id: int) -> str:
+    return f"M{int(member_id):03d}"
+
+
+def member_ref_label(reference: str, nom: str, prenom: str, village: str, telephone: str) -> str:
+    village_safe = (village or "").strip() or "-"
+    tel_safe = (telephone or "").strip() or "-"
+    return f"{reference} | {nom} {prenom} | {village_safe} | {tel_safe}"
+
+
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -25,6 +35,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             nom TEXT NOT NULL,
             prenom TEXT NOT NULL,
             telephone TEXT NOT NULL DEFAULT '',
+            village_origine TEXT NOT NULL DEFAULT '',
             adresse TEXT NOT NULL DEFAULT '',
             prefecture TEXT NOT NULL DEFAULT '',
             email TEXT NOT NULL DEFAULT '',
@@ -33,12 +44,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         """
     )
-    cur.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_member_identity
-        ON membres(nom, prenom, telephone);
-        """
-    )
+    # Homonymes autorises: on ne bloque plus nom/prenom/telephone.
+    cur.execute("DROP INDEX IF EXISTS idx_member_identity;")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS contributions (
@@ -93,6 +100,15 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    # Migration legere: ajoute un identifiant membre unique et stable.
+    cols = [row["name"] for row in conn.execute("PRAGMA table_info(membres)").fetchall()]
+    if "reference" not in cols:
+        conn.execute("ALTER TABLE membres ADD COLUMN reference TEXT;")
+    if "village_origine" not in cols:
+        conn.execute("ALTER TABLE membres ADD COLUMN village_origine TEXT NOT NULL DEFAULT '';")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_membres_reference ON membres(reference);")
+    # Normalise toutes les references au format M007.
+    conn.execute("UPDATE membres SET reference = printf('M%03d', id);")
     conn.commit()
 
 
@@ -215,13 +231,16 @@ def total_expenses(conn: sqlite3.Connection, year: Optional[int] = None) -> floa
     return float(row["total"])
 
 
-def get_members_status(conn: sqlite3.Connection, year: int) -> pd.DataFrame:
+def get_members_status(conn: sqlite3.Connection, year: int, include_archived: bool = False) -> pd.DataFrame:
+    where_clause = "" if include_archived else "WHERE actif = 1"
     members = fetch_df(
         conn,
         """
-        SELECT id, nom, prenom, telephone, email, date_inscription
+        SELECT id, reference, nom, prenom, telephone, village_origine, email, date_inscription, actif
         FROM membres
-        WHERE actif = 1
+        """
+        + where_clause
+        + """
         ORDER BY nom, prenom;
         """,
     )
@@ -264,8 +283,24 @@ def get_members_status(conn: sqlite3.Connection, year: int) -> pd.DataFrame:
     merged["attendu"] = expected
     merged["reste"] = (merged["attendu"] - merged["total_paye"]).clip(lower=0)
     merged["statut"] = merged["reste"].apply(lambda x: "A jour" if abs(x) < 0.001 else "En retard")
+    if "village_origine" not in merged.columns:
+        merged["village_origine"] = ""
     return merged[
-        ["id", "nom", "prenom", "telephone", "email", "montant_du", "total_paye", "attendu", "reste", "statut"]
+        [
+            "id",
+            "reference",
+            "actif",
+            "nom",
+            "prenom",
+            "telephone",
+            "village_origine",
+            "email",
+            "montant_du",
+            "total_paye",
+            "attendu",
+            "reste",
+            "statut",
+        ]
     ]
 
 
@@ -277,6 +312,7 @@ def page_membres(conn: sqlite3.Connection) -> None:
             nom = st.text_input("Nom *").strip()
             prenom = st.text_input("Prénom *").strip()
             telephone = st.text_input("Téléphone").strip()
+            village_origine = st.text_input("Village d'origine").strip()
             prefecture = st.text_input("Préfecture").strip()
         with c2:
             email = st.text_input("Email").strip()
@@ -291,50 +327,172 @@ def page_membres(conn: sqlite3.Connection) -> None:
                 st.error("Email invalide.")
             else:
                 try:
-                    conn.execute(
+                    cur = conn.execute(
                         """
-                        INSERT INTO membres(nom, prenom, telephone, adresse, prefecture, email, date_inscription, actif)
-                        VALUES(?, ?, ?, ?, ?, ?, ?, 1);
+                        INSERT INTO membres(reference, nom, prenom, telephone, village_origine, adresse, prefecture, email, date_inscription, actif)
+                        VALUES('', ?, ?, ?, ?, ?, ?, ?, ?, 1);
                         """,
-                        (nom, prenom, telephone, adresse, prefecture, email, to_iso(date_inscription)),
+                        (nom, prenom, telephone, village_origine, adresse, prefecture, email, to_iso(date_inscription)),
+                    )
+                    new_id = int(cur.lastrowid)
+                    conn.execute("UPDATE membres SET reference = ? WHERE id = ?", (member_ref(new_id), new_id))
+                    log_activity(
+                        conn,
+                        type_operation="CREATE",
+                        entite="membre",
+                        entite_id=new_id,
+                        details=(
+                            f"Ajout membre ref={member_ref(new_id)} nom={nom} prenom={prenom} "
+                            f"village={village_origine or '-'} tel={telephone or '-'}"
+                        ),
                     )
                     conn.commit()
                     st.success("Membre ajouté.")
                 except sqlite3.IntegrityError:
-                    st.error("Ce membre existe déjà (même nom/prénom/téléphone).")
+                    st.error("Impossible d'ajouter ce membre (integrite des donnees).")
 
     st.markdown("### Liste des membres")
+    view_mode = st.radio(
+        "Afficher",
+        ["Actifs", "Archivés", "Tous"],
+        horizontal=True,
+    )
+    where_sql = "WHERE actif = 1"
+    if view_mode == "Archivés":
+        where_sql = "WHERE actif = 0"
+    elif view_mode == "Tous":
+        where_sql = ""
+
     df = fetch_df(
         conn,
         """
-        SELECT id, nom, prenom, telephone, prefecture, email, adresse, date_inscription
+        SELECT
+            id,
+            reference,
+            CASE WHEN actif = 1 THEN 'Actif' ELSE 'Archive' END AS etat,
+            nom, prenom, telephone, village_origine, prefecture, email, adresse, date_inscription
         FROM membres
-        WHERE actif = 1
+        """
+        + where_sql
+        + """
         ORDER BY nom, prenom;
         """,
     )
+    if not df.empty:
+        df["reference_complete"] = df.apply(
+            lambda r: member_ref_label(
+                str(r["reference"]),
+                str(r["nom"]),
+                str(r["prenom"]),
+                str(r["village_origine"] or ""),
+                str(r["telephone"] or ""),
+            ),
+            axis=1,
+        )
+        search = st.text_input("Recherche (référence, nom, téléphone)", "").strip().lower()
+        if search:
+            filt = (
+                df["reference_complete"].str.lower().str.contains(search, na=False)
+                | df["nom"].str.lower().str.contains(search, na=False)
+                | df["prenom"].str.lower().str.contains(search, na=False)
+                | df["telephone"].str.lower().str.contains(search, na=False)
+            )
+            df = df[filt]
     st.dataframe(df, use_container_width=True)
 
+    status_year = st.number_input(
+        "Année pour statut/décompte membres",
+        min_value=2020,
+        max_value=2100,
+        value=date.today().year,
+        step=1,
+        key="members_status_year",
+    )
+    st.markdown("### Statut et décompte des membres")
+    status_df = get_members_status(conn, int(status_year), include_archived=True)
+    if view_mode == "Actifs":
+        status_df = status_df[status_df["actif"] == 1]
+    elif view_mode == "Archivés":
+        status_df = status_df[status_df["actif"] == 0]
+    status_df = status_df.copy()
+    status_df["etat"] = status_df["actif"].apply(lambda v: "Actif" if int(v) == 1 else "Archive")
+    st.dataframe(
+        status_df[
+            [
+                "reference",
+                "etat",
+                "nom",
+                "prenom",
+                "telephone",
+                "village_origine",
+                "email",
+                "montant_du",
+                "total_paye",
+                "attendu",
+                "reste",
+                "statut",
+            ]
+        ],
+        use_container_width=True,
+    )
+
     if not df.empty:
-        options = {f"{r['nom']} {r['prenom']} ({r['id']})": int(r["id"]) for _, r in df.iterrows()}
-        selected = st.selectbox("Membre à archiver", list(options.keys()))
-        if st.button("Archiver le membre", type="secondary"):
-            conn.execute("UPDATE membres SET actif = 0 WHERE id = ?", (options[selected],))
-            conn.commit()
-            st.success("Membre archivé.")
+        options = {
+            (
+                f"{r['reference']} | {r['nom']} {r['prenom']} | "
+                f"village:{r['village_origine'] or '-'} | tel:{r['telephone'] or '-'} | etat:{r['etat']}"
+            ): int(r["id"])
+            for _, r in df.iterrows()
+        }
+        selected = st.selectbox("Membre à modifier", list(options.keys()))
+        selected_id = options[selected]
+        member_row = conn.execute(
+            "SELECT id, actif, reference, nom, prenom FROM membres WHERE id = ?",
+            (selected_id,),
+        ).fetchone()
+        if member_row and int(member_row["actif"]) == 1:
+            if st.button("Archiver le membre", type="secondary"):
+                conn.execute("UPDATE membres SET actif = 0 WHERE id = ?", (selected_id,))
+                log_activity(
+                    conn,
+                    type_operation="UPDATE",
+                    entite="membre",
+                    entite_id=selected_id,
+                    details=f"Archivage membre ref={member_row['reference']} nom={member_row['nom']} {member_row['prenom']}",
+                )
+                conn.commit()
+                st.success("Membre archivé.")
+        if member_row and int(member_row["actif"]) == 0:
+            if st.button("Réactiver le membre"):
+                conn.execute("UPDATE membres SET actif = 1 WHERE id = ?", (selected_id,))
+                log_activity(
+                    conn,
+                    type_operation="UPDATE",
+                    entite="membre",
+                    entite_id=selected_id,
+                    details=f"Reactivation membre ref={member_row['reference']} nom={member_row['nom']} {member_row['prenom']}",
+                )
+                conn.commit()
+                st.success("Membre réactivé.")
 
 
 def page_contributions(conn: sqlite3.Connection) -> None:
     st.subheader("Contributions")
     members = fetch_df(
         conn,
-        "SELECT id, nom, prenom FROM membres WHERE actif = 1 ORDER BY nom, prenom",
+        "SELECT id, reference, nom, prenom, village_origine, telephone FROM membres WHERE actif = 1 ORDER BY nom, prenom",
     )
     if members.empty:
         st.info("Ajoute d'abord au moins un membre.")
         return
 
-    member_options = {f"{r['nom']} {r['prenom']} ({r['id']})": int(r["id"]) for _, r in members.iterrows()}
+    member_options = {
+        (
+            f"{r['reference']} | {r['nom']} {r['prenom']} | "
+            f"{r['village_origine'] or '-'} | {r['telephone'] or '-'} ({r['id']})"
+        ): int(r["id"])
+        for _, r in members.iterrows()
+    }
 
     with st.form("add_contribution", clear_on_submit=True):
         member_label = st.selectbox("Membre", list(member_options.keys()))
