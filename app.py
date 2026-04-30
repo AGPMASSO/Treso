@@ -81,6 +81,18 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS activites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            type_operation TEXT NOT NULL,
+            entite TEXT NOT NULL,
+            entite_id INTEGER,
+            details TEXT NOT NULL
+        );
+        """
+    )
     conn.commit()
 
 
@@ -128,6 +140,13 @@ def upsert_association_report(conn: sqlite3.Connection, year: int, amount: float
         """,
         (year, amount),
     )
+    log_activity(
+        conn,
+        type_operation="UPDATE",
+        entite="reports_association",
+        entite_id=year,
+        details=f"Solde reporte association annee {year} = {amount:.2f} EUR",
+    )
     conn.commit()
 
 
@@ -140,7 +159,30 @@ def upsert_member_report(conn: sqlite3.Connection, member_id: int, year: int, am
         """,
         (member_id, year, amount_due),
     )
+    log_activity(
+        conn,
+        type_operation="UPDATE",
+        entite="reports_membres",
+        entite_id=member_id,
+        details=f"Report membre id={member_id} annee {year} = {amount_due:.2f} EUR",
+    )
     conn.commit()
+
+
+def log_activity(
+    conn: sqlite3.Connection,
+    type_operation: str,
+    entite: str,
+    entite_id: Optional[int],
+    details: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO activites(created_at, type_operation, entite, entite_id, details)
+        VALUES(?, ?, ?, ?, ?)
+        """,
+        (datetime.now().isoformat(timespec="seconds"), type_operation, entite, entite_id, details),
+    )
 
 
 def total_contributions(conn: sqlite3.Connection, year: Optional[int] = None) -> float:
@@ -301,9 +343,19 @@ def page_contributions(conn: sqlite3.Connection) -> None:
         note = st.text_input("Note (optionnel)")
         submitted = st.form_submit_button("Enregistrer")
         if submitted:
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO contributions(membre_id, montant, date, note) VALUES(?, ?, ?, ?)",
                 (member_options[member_label], float(montant), to_iso(contribution_date), note.strip()),
+            )
+            log_activity(
+                conn,
+                type_operation="CREATE",
+                entite="contribution",
+                entite_id=cur.lastrowid,
+                details=(
+                    f"Ajout cotisation id={cur.lastrowid}, membre_id={member_options[member_label]}, "
+                    f"montant={float(montant):.2f} EUR, date={to_iso(contribution_date)}"
+                ),
             )
             conn.commit()
             st.success("Contribution enregistrée.")
@@ -323,6 +375,94 @@ def page_contributions(conn: sqlite3.Connection) -> None:
     )
     st.dataframe(hist, use_container_width=True)
     st.metric("Total contributions (année)", f"{total_contributions(conn, int(year)):.2f} EUR")
+
+    if not hist.empty:
+        st.markdown("### Corriger une contribution")
+        row_options = {
+            f"id={int(r['id'])} | {r['date']} | {r['nom']} {r['prenom']} | {float(r['montant']):.2f} EUR": int(r["id"])
+            for _, r in hist.iterrows()
+        }
+        selected_label = st.selectbox("Contribution à corriger", list(row_options.keys()))
+        selected_id = row_options[selected_label]
+        row = conn.execute(
+            "SELECT id, membre_id, montant, date, note FROM contributions WHERE id = ?",
+            (selected_id,),
+        ).fetchone()
+        if row:
+            reverse_members = {v: k for k, v in member_options.items()}
+            default_member_label = reverse_members.get(int(row["membre_id"]), list(member_options.keys())[0])
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                edit_member = st.selectbox(
+                    "Membre (édition)",
+                    list(member_options.keys()),
+                    index=list(member_options.keys()).index(default_member_label),
+                    key=f"edit_member_{selected_id}",
+                )
+            with c2:
+                edit_amount = st.number_input(
+                    "Montant (édition)",
+                    min_value=0.01,
+                    value=float(row["montant"]),
+                    step=1.0,
+                    key=f"edit_amount_{selected_id}",
+                )
+            with c3:
+                edit_date = st.date_input(
+                    "Date (édition)",
+                    value=datetime.fromisoformat(row["date"]).date(),
+                    key=f"edit_date_{selected_id}",
+                )
+            with c4:
+                edit_note = st.text_input(
+                    "Note (édition)",
+                    value=row["note"] or "",
+                    key=f"edit_note_{selected_id}",
+                )
+
+            b1, b2 = st.columns(2)
+            with b1:
+                if st.button("Mettre à jour la contribution", key=f"update_contrib_{selected_id}"):
+                    before = f"membre_id={row['membre_id']}, montant={float(row['montant']):.2f}, date={row['date']}, note={row['note'] or ''}"
+                    conn.execute(
+                        """
+                        UPDATE contributions
+                        SET membre_id = ?, montant = ?, date = ?, note = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            member_options[edit_member],
+                            float(edit_amount),
+                            to_iso(edit_date),
+                            edit_note.strip(),
+                            selected_id,
+                        ),
+                    )
+                    after = (
+                        f"membre_id={member_options[edit_member]}, montant={float(edit_amount):.2f}, "
+                        f"date={to_iso(edit_date)}, note={edit_note.strip()}"
+                    )
+                    log_activity(
+                        conn,
+                        type_operation="UPDATE",
+                        entite="contribution",
+                        entite_id=selected_id,
+                        details=f"Maj cotisation id={selected_id} | avant: [{before}] | apres: [{after}]",
+                    )
+                    conn.commit()
+                    st.success("Contribution mise à jour.")
+            with b2:
+                if st.button("Supprimer la contribution", type="secondary", key=f"delete_contrib_{selected_id}"):
+                    conn.execute("DELETE FROM contributions WHERE id = ?", (selected_id,))
+                    log_activity(
+                        conn,
+                        type_operation="DELETE",
+                        entite="contribution",
+                        entite_id=selected_id,
+                        details=f"Suppression cotisation id={selected_id}",
+                    )
+                    conn.commit()
+                    st.success("Contribution supprimée.")
 
     st.markdown("### Statut des membres")
     status = get_members_status(conn, int(year))
@@ -359,6 +499,14 @@ def page_depenses(conn: sqlite3.Connection) -> None:
                     "INSERT INTO depenses(description, montant, date) VALUES(?, ?, ?)",
                     (description, float(montant), to_iso(depense_date)),
                 )
+                dep_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+                log_activity(
+                    conn,
+                    type_operation="CREATE",
+                    entite="depense",
+                    entite_id=int(dep_id),
+                    details=f"Ajout depense id={int(dep_id)}, {description}, montant={float(montant):.2f} EUR, date={to_iso(depense_date)}",
+                )
                 conn.commit()
                 st.success("Dépense enregistrée.")
 
@@ -376,6 +524,90 @@ def page_depenses(conn: sqlite3.Connection) -> None:
     st.dataframe(dep, use_container_width=True)
     st.metric("Total dépenses (année)", f"{total_expenses(conn, int(year)):.2f} EUR")
 
+    if not dep.empty:
+        st.markdown("### Corriger une dépense")
+        dep_options = {
+            f"id={int(r['id'])} | {r['date']} | {r['description']} | {float(r['montant']):.2f} EUR": int(r["id"])
+            for _, r in dep.iterrows()
+        }
+        selected_dep_label = st.selectbox("Dépense à corriger", list(dep_options.keys()))
+        selected_dep_id = dep_options[selected_dep_label]
+        dep_row = conn.execute(
+            "SELECT id, date, description, montant FROM depenses WHERE id = ?",
+            (selected_dep_id,),
+        ).fetchone()
+        if dep_row:
+            d1, d2, d3 = st.columns(3)
+            with d1:
+                edit_dep_desc = st.text_input(
+                    "Description (édition)",
+                    value=dep_row["description"] or "",
+                    key=f"edit_dep_desc_{selected_dep_id}",
+                )
+            with d2:
+                edit_dep_amount = st.number_input(
+                    "Montant (édition)",
+                    min_value=0.01,
+                    value=float(dep_row["montant"]),
+                    step=1.0,
+                    key=f"edit_dep_amount_{selected_dep_id}",
+                )
+            with d3:
+                edit_dep_date = st.date_input(
+                    "Date (édition)",
+                    value=datetime.fromisoformat(dep_row["date"]).date(),
+                    key=f"edit_dep_date_{selected_dep_id}",
+                )
+
+            x1, x2 = st.columns(2)
+            with x1:
+                if st.button("Mettre à jour la dépense", key=f"update_dep_{selected_dep_id}"):
+                    if not edit_dep_desc.strip():
+                        st.error("Description obligatoire.")
+                    else:
+                        before = (
+                            f"description={dep_row['description']}, montant={float(dep_row['montant']):.2f}, "
+                            f"date={dep_row['date']}"
+                        )
+                        conn.execute(
+                            """
+                            UPDATE depenses
+                            SET description = ?, montant = ?, date = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                edit_dep_desc.strip(),
+                                float(edit_dep_amount),
+                                to_iso(edit_dep_date),
+                                selected_dep_id,
+                            ),
+                        )
+                        after = (
+                            f"description={edit_dep_desc.strip()}, montant={float(edit_dep_amount):.2f}, "
+                            f"date={to_iso(edit_dep_date)}"
+                        )
+                        log_activity(
+                            conn,
+                            type_operation="UPDATE",
+                            entite="depense",
+                            entite_id=selected_dep_id,
+                            details=f"Maj depense id={selected_dep_id} | avant: [{before}] | apres: [{after}]",
+                        )
+                        conn.commit()
+                        st.success("Dépense mise à jour.")
+            with x2:
+                if st.button("Supprimer la dépense", type="secondary", key=f"delete_dep_{selected_dep_id}"):
+                    conn.execute("DELETE FROM depenses WHERE id = ?", (selected_dep_id,))
+                    log_activity(
+                        conn,
+                        type_operation="DELETE",
+                        entite="depense",
+                        entite_id=selected_dep_id,
+                        details=f"Suppression depense id={selected_dep_id}",
+                    )
+                    conn.commit()
+                    st.success("Dépense supprimée.")
+
 
 def page_dashboard(conn: sqlite3.Connection) -> None:
     st.subheader("Dashboard")
@@ -392,6 +624,7 @@ def page_dashboard(conn: sqlite3.Connection) -> None:
     contrib = total_contributions(conn, year)
     dep = total_expenses(conn, year)
     report = get_association_report(conn, year)
+    report_n2 = get_association_report(conn, year - 1)
     solde = report + contrib - dep
 
     c1, c2, c3, c4 = st.columns(4)
@@ -399,6 +632,8 @@ def page_dashboard(conn: sqlite3.Connection) -> None:
     c2.metric("Dépenses", f"{dep:.2f} EUR")
     c3.metric("Report N-1", f"{report:.2f} EUR")
     c4.metric("Solde actuel", f"{solde:.2f} EUR")
+    n1 = st.columns(1)[0]
+    n1.metric("Solde N-2", f"{report_n2:.2f} EUR")
 
     graph_df = pd.DataFrame(
         {
@@ -443,6 +678,26 @@ def page_dashboard(conn: sqlite3.Connection) -> None:
     st.line_chart(monthly.set_index("mois")[["contributions", "depenses", "solde_net"]])
 
 
+def page_activite(conn: sqlite3.Connection) -> None:
+    st.subheader("Activité")
+    st.caption("Trace des derniers mouvements: cotisations, depenses et modifications.")
+    limit = st.selectbox("Nombre de derniers mouvements", [5, 10, 20, 50, 100], index=2)
+    logs = fetch_df(
+        conn,
+        """
+        SELECT id, created_at, type_operation, entite, entite_id, details
+        FROM activites
+        ORDER BY id DESC
+        LIMIT ?;
+        """,
+        (int(limit),),
+    )
+    if logs.empty:
+        st.info("Aucun mouvement enregistre pour le moment.")
+    else:
+        st.dataframe(logs, use_container_width=True)
+
+
 def main() -> None:
     st.set_page_config(page_title="AGPM - Gestion Association", layout="wide")
     st.title("AGPM - Gestion de l'association")
@@ -451,7 +706,7 @@ def main() -> None:
     conn = get_conn()
     init_db(conn)
 
-    menu = st.sidebar.radio("Navigation", ["Membres", "Contributions", "Dépenses", "Dashboard"])
+    menu = st.sidebar.radio("Navigation", ["Membres", "Contributions", "Dépenses", "Dashboard", "Activité"])
     st.sidebar.info("Les calculs sont basés sur les transactions réelles, pas sur des cellules Excel.")
 
     if menu == "Membres":
@@ -460,6 +715,8 @@ def main() -> None:
         page_contributions(conn)
     elif menu == "Dépenses":
         page_depenses(conn)
+    elif menu == "Activité":
+        page_activite(conn)
     else:
         page_dashboard(conn)
 
