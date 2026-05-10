@@ -1,6 +1,11 @@
+import calendar
+import json
+import re
 import sqlite3
+import unicodedata
 from datetime import date, datetime
-from typing import Optional
+from io import BytesIO
+from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
@@ -872,6 +877,761 @@ def page_activite(conn: sqlite3.Connection) -> None:
         st.dataframe(logs, use_container_width=True)
 
 
+# --- Import Excel (structure classeur AGPM Association) ---------------------------------
+
+MONTH_ORDER_FR = [
+    "janvier",
+    "fevrier",
+    "mars",
+    "avril",
+    "mai",
+    "juin",
+    "juillet",
+    "aout",
+    "septembre",
+    "octobre",
+    "novembre",
+    "decembre",
+]
+
+SOLDE_COL_RE = re.compile(r"solde\s*(\d{4})", re.IGNORECASE)
+COTISATIONS_SHEET_RE = re.compile(r"^cotisations\s*(\d{4})$", re.IGNORECASE)
+DEPENSES_SHEET_RE = re.compile(r"^d[ée]penses\s*(\d{4})$", re.IGNORECASE)
+
+
+def _strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+
+
+def normalize_header(name: object) -> str:
+    if pd.isna(name):
+        return ""
+    return _strip_accents(str(name).strip().lower())
+
+
+def normalize_phone(raw: object) -> str:
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return ""
+    return re.sub(r"\D", "", str(raw))
+
+
+def excel_member_key(nom: object, prenom: object, tel_raw: object) -> tuple[str, str, str]:
+    n = str(nom).strip().lower() if pd.notna(nom) else ""
+    p = str(prenom).strip().lower() if pd.notna(prenom) else ""
+    return (n, p, normalize_phone(tel_raw))
+
+
+# UID import : ("t", nom_l, prenom_l, tel) si téléphone dès Excel ; sinon ("r", feuille, n° ligne) pour éviter
+# de fusionner deux homonymes sans numéro avant que vous complétiez le téléphone dans l'interface.
+MemberImportUid = tuple[str | int, ...]
+
+
+def member_import_uid(nom: object, prenom: object, tel_raw: object, sheet: str, row_num: int) -> MemberImportUid:
+    n = str(nom).strip().lower() if pd.notna(nom) else ""
+    p = str(prenom).strip().lower() if pd.notna(prenom) else ""
+    t = normalize_phone(tel_raw)
+    if t:
+        return ("t", n, p, t)
+    return ("r", sheet, row_num)
+
+
+def uid_import_to_json(uid: MemberImportUid) -> str:
+    return json.dumps(list(uid))
+
+
+def uid_import_from_json(s: str) -> MemberImportUid:
+    L = json.loads(s)
+    kind = L[0]
+    if kind == "r":
+        return ("r", str(L[1]), int(L[2]))
+    return ("t", str(L[1]), str(L[2]), str(L[3]))
+
+
+def member_import_row_label(uid: MemberImportUid) -> str:
+    if uid[0] == "r":
+        return f"{uid[1]}, ligne {uid[2]}"
+    return "Téléphone lu depuis Excel"
+
+
+def sync_member_phones_from_editor(bundle: dict[str, Any], edited: pd.DataFrame) -> None:
+    """Met à jour bundle['members'][uid]['telephone'] depuis la colonne éditée (_uid_json + telephone)."""
+    if edited.empty or "_uid_json" not in edited.columns:
+        return
+    members = bundle["members"]
+    col_tel = "telephone" if "telephone" in edited.columns else None
+    if not col_tel:
+        return
+    for _, row in edited.iterrows():
+        uid = uid_import_from_json(str(row["_uid_json"]))
+        if uid not in members:
+            continue
+        raw_tel = row[col_tel]
+        members[uid]["telephone"] = normalize_phone(raw_tel)
+
+
+def collapse_bundle_members_by_phone(bundle: dict[str, Any]) -> None:
+    """Fusionne les entrées ayant le même nom+prénom+téléphone (téléphone non vide après édition)."""
+    members: dict[MemberImportUid, dict[str, str]] = bundle["members"]
+    contributions: list[dict[str, object]] = bundle["contributions"]
+    reports: list[dict[str, object]] = bundle["reports"]
+
+    groups: dict[tuple[str, str, str], list[MemberImportUid]] = {}
+    for uid, info in members.items():
+        dk = excel_member_key(info["nom"], info["prenom"], info["telephone"])
+        if dk[2] == "":
+            continue
+        groups.setdefault(dk, []).append(uid)
+
+    uid_redirect: dict[MemberImportUid, MemberImportUid] = {uid: uid for uid in members}
+
+    for uids in groups.values():
+        if len(uids) < 2:
+            continue
+        canon = uids[0]
+        merged = dict(members[canon])
+        for u in uids[1:]:
+            ou = members[u]
+            merged["telephone"] = merge_member_field(merged["telephone"], ou["telephone"])
+            merged["email"] = merge_member_field(merged["email"], ou["email"])
+            merged["adresse"] = merge_member_field(merged["adresse"], ou["adresse"])
+            merged["village_origine"] = merge_member_field(merged["village_origine"], ou["village_origine"])
+            merged["prefecture"] = merge_member_field(merged["prefecture"], ou["prefecture"])
+            uid_redirect[u] = canon
+            del members[u]
+        members[canon] = merged
+
+    for c in contributions:
+        ouid = c["member_uid"]
+        c["member_uid"] = uid_redirect.get(ouid, ouid)
+    for r in reports:
+        ouid = r["member_uid"]
+        r["member_uid"] = uid_redirect.get(ouid, ouid)
+
+
+def validate_bundle_phones(bundle: dict[str, Any]) -> list[str]:
+    errs: list[str] = []
+    for uid, info in bundle["members"].items():
+        if not normalize_phone(info["telephone"]):
+            label = f"{info['nom']} {info['prenom']}"
+            if uid[0] == "r":
+                label += f" ({uid[1]}, ligne {uid[2]})"
+            errs.append(label)
+    return errs
+
+
+def parse_money_cell(val: object) -> Optional[float]:
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    if isinstance(val, str):
+        v = val.strip().lower()
+        if v in ("", "x", "p", "a", "-", "np", "n/p"):
+            return None
+        try:
+            return float(v.replace(",", "."))
+        except ValueError:
+            return None
+    try:
+        f = float(val)
+        if f <= 0:
+            return None
+        return f
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_solde_report_amount(val: object) -> Optional[float]:
+    """Convertit une cellule Solde Excel en montant_dû (>= 0) pour reports_membres."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    # Excel: solde négatif = retard à reporter
+    if f < 0:
+        return round(abs(f), 2)
+    return 0.0
+
+
+def month_columns_from_df(df: pd.DataFrame) -> dict[int, str]:
+    norm_to_orig = {normalize_header(c): c for c in df.columns}
+    mapping: dict[int, str] = {}
+    for mi, key in enumerate(MONTH_ORDER_FR, start=1):
+        if key in norm_to_orig:
+            mapping[mi] = norm_to_orig[key]
+    return mapping
+
+
+def solde_columns_from_df(df: pd.DataFrame) -> list[tuple[int, str]]:
+    out: list[tuple[int, str]] = []
+    for c in df.columns:
+        m = SOLDE_COL_RE.search(str(c))
+        if m:
+            out.append((int(m.group(1)), str(c)))
+    return out
+
+
+def resolve_col(df: pd.DataFrame, *candidates: str) -> Optional[str]:
+    norm_to_orig = {normalize_header(c): c for c in df.columns}
+    for cand in candidates:
+        nn = normalize_header(cand)
+        if nn in norm_to_orig:
+            return norm_to_orig[nn]
+    return None
+
+
+def cotisation_sheet_year(name: str) -> Optional[int]:
+    m = COTISATIONS_SHEET_RE.match(name.strip())
+    return int(m.group(1)) if m else None
+
+
+def depenses_sheet_year(name: str) -> Optional[int]:
+    m = DEPENSES_SHEET_RE.match(name.strip())
+    return int(m.group(1)) if m else None
+
+
+def last_day_of_month(year: int, month: int) -> date:
+    last = calendar.monthrange(year, month)[1]
+    return date(year, month, last)
+
+
+def merge_member_field(prev: str, new_val: object) -> str:
+    if new_val is None or (isinstance(new_val, float) and pd.isna(new_val)):
+        return prev
+    s = str(new_val).strip()
+    if not s:
+        return prev
+    return s if not prev else prev
+
+
+def load_existing_member_keys(conn: sqlite3.Connection) -> dict[tuple[str, str, str], int]:
+    rows = conn.execute("SELECT id, nom, prenom, telephone FROM membres").fetchall()
+    out: dict[tuple[str, str, str], int] = {}
+    for r in rows:
+        k = excel_member_key(r["nom"], r["prenom"], r["telephone"])
+        out[k] = int(r["id"])
+    return out
+
+
+def contribution_note_import(sheet_label: str, month_fr: str) -> str:
+    return f"Excel {sheet_label} {month_fr.capitalize()}"
+
+
+def contribution_exists(
+    conn: sqlite3.Connection,
+    membre_id: int,
+    date_iso: str,
+    montant: float,
+    note: str,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1 FROM contributions
+        WHERE membre_id = ? AND date = ? AND ABS(montant - ?) < 0.001 AND note = ?
+        LIMIT 1
+        """,
+        (membre_id, date_iso, montant, note),
+    ).fetchone()
+    return row is not None
+
+
+def depense_exists(conn: sqlite3.Connection, description: str, date_iso: str, montant: float) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1 FROM depenses
+        WHERE description = ? AND date = ? AND ABS(montant - ?) < 0.001
+        LIMIT 1
+        """,
+        (description, date_iso, montant),
+    ).fetchone()
+    return row is not None
+
+
+def insert_membre_from_import(
+    conn: sqlite3.Connection,
+    nom: str,
+    prenom: str,
+    telephone: str,
+    village_origine: str,
+    prefecture: str,
+    email: str,
+    adresse: str,
+    date_inscription: date,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO membres(reference, nom, prenom, telephone, village_origine, adresse, prefecture, email, date_inscription, actif)
+        VALUES('', ?, ?, ?, ?, ?, ?, ?, ?, 1);
+        """,
+        (
+            nom.strip(),
+            prenom.strip(),
+            telephone.strip(),
+            village_origine.strip(),
+            adresse.strip(),
+            prefecture.strip(),
+            email.strip(),
+            to_iso(date_inscription),
+        ),
+    )
+    new_id = int(cur.lastrowid)
+    conn.execute("UPDATE membres SET reference = ? WHERE id = ?", (member_ref(new_id), new_id))
+    log_activity(
+        conn,
+        type_operation="CREATE",
+        entite="membre",
+        entite_id=new_id,
+        details=(
+            f"Import Excel ref={member_ref(new_id)} nom={nom.strip()} prenom={prenom.strip()} "
+            f"village={village_origine or '-'} tel={telephone or '-'}"
+        ),
+    )
+    return new_id
+
+
+def parse_workbook_preview(
+    raw: bytes,
+    cotisation_sheets: list[str],
+    depense_sheets: list[str],
+    import_reports: bool,
+    default_inscription: date,
+) -> dict[str, Any]:
+    xl = pd.ExcelFile(BytesIO(raw), engine="openpyxl")
+
+    members: dict[MemberImportUid, dict[str, str]] = {}
+    contributions: list[dict[str, object]] = []
+    reports: list[dict[str, object]] = []
+    depenses: list[dict[str, object]] = []
+
+    month_labels = [
+        "janvier",
+        "fevrier",
+        "mars",
+        "avril",
+        "mai",
+        "juin",
+        "juillet",
+        "aout",
+        "septembre",
+        "octobre",
+        "novembre",
+        "decembre",
+    ]
+
+    for sheet in cotisation_sheets:
+        sheet_year = cotisation_sheet_year(sheet)
+        if sheet_year is None:
+            continue
+        df = pd.read_excel(BytesIO(raw), sheet_name=sheet, header=3, engine="openpyxl")
+        col_nom = resolve_col(df, "Nom")
+        col_prenom = resolve_col(df, "Prenom", "Prénom")
+        col_tel = resolve_col(df, "telephone", "téléphone", "tel")
+        col_pref = resolve_col(df, "Prefecture", "Préfecture", "prefecture")
+        col_mail = resolve_col(df, "email", "e-mail")
+        col_addr = resolve_col(df, "adresse")
+        if not col_nom or not col_prenom:
+            continue
+
+        month_cols = month_columns_from_df(df)
+        solde_cols = solde_columns_from_df(df) if import_reports else []
+
+        for row_num, (_, row) in enumerate(df.iterrows(), start=1):
+            nom_v = row[col_nom]
+            prenom_v = row[col_prenom]
+            if pd.isna(nom_v) or str(nom_v).strip() == "":
+                continue
+            if pd.isna(prenom_v) or str(prenom_v).strip() == "":
+                continue
+
+            uid = member_import_uid(nom_v, prenom_v, row[col_tel] if col_tel else "", sheet, row_num)
+            tel_str = normalize_phone(row[col_tel]) if col_tel else ""
+            pref = str(row[col_pref]).strip() if col_pref and pd.notna(row[col_pref]) else ""
+            mail = str(row[col_mail]).strip() if col_mail and pd.notna(row[col_mail]) else ""
+            addr = str(row[col_addr]).strip() if col_addr and pd.notna(row[col_addr]) else ""
+
+            if uid not in members:
+                members[uid] = {
+                    "nom": str(nom_v).strip(),
+                    "prenom": str(prenom_v).strip(),
+                    "telephone": tel_str,
+                    "village_origine": pref,
+                    "prefecture": pref,
+                    "email": mail,
+                    "adresse": addr,
+                }
+            else:
+                m = members[uid]
+                m["telephone"] = merge_member_field(m["telephone"], tel_str if tel_str else None)
+                m["email"] = merge_member_field(m["email"], mail if mail else None)
+                m["adresse"] = merge_member_field(m["adresse"], addr if addr else None)
+                m["village_origine"] = merge_member_field(m["village_origine"], pref if pref else None)
+                m["prefecture"] = merge_member_field(m["prefecture"], pref if pref else None)
+
+            for mi, col_name in month_cols.items():
+                amt = parse_money_cell(row[col_name])
+                if amt is None:
+                    continue
+                d = last_day_of_month(sheet_year, mi)
+                contributions.append(
+                    {
+                        "member_uid": uid,
+                        "nom": str(nom_v).strip(),
+                        "prenom": str(prenom_v).strip(),
+                        "telephone": tel_str,
+                        "annee": sheet_year,
+                        "mois": mi,
+                        "montant": round(float(amt), 2),
+                        "date_iso": d.isoformat(),
+                        "note": contribution_note_import(sheet, month_labels[mi - 1]),
+                    }
+                )
+
+            if import_reports:
+                for solde_year, col_name in solde_cols:
+                    report_annee = solde_year + 1
+                    rep_amt = parse_solde_report_amount(row[col_name])
+                    if rep_amt is None:
+                        continue
+                    if rep_amt <= 0:
+                        continue
+                    reports.append(
+                        {
+                            "member_uid": uid,
+                            "nom": str(nom_v).strip(),
+                            "prenom": str(prenom_v).strip(),
+                            "telephone": tel_str,
+                            "report_annee": report_annee,
+                            "montant_du": float(rep_amt),
+                            "source_col": col_name,
+                            "source_sheet": sheet,
+                        }
+                    )
+
+    for sheet in depense_sheets:
+        year_d = depenses_sheet_year(sheet)
+        if year_d is None:
+            continue
+        df = pd.read_excel(BytesIO(raw), sheet_name=sheet, header=2, engine="openpyxl")
+        col_lib = resolve_col(df, "Libellé", "Libelle")
+        if not col_lib:
+            continue
+        month_cols = month_columns_from_df(df)
+
+        for _, row in df.iterrows():
+            lib_v = row[col_lib]
+            if pd.isna(lib_v) or str(lib_v).strip() == "":
+                continue
+            desc = str(lib_v).strip()
+            for mi, col_name in month_cols.items():
+                amt = parse_money_cell(row[col_name])
+                if amt is None:
+                    continue
+                d = last_day_of_month(year_d, mi)
+                depenses.append(
+                    {
+                        "description": desc[:500],
+                        "montant": round(float(amt), 2),
+                        "date_iso": d.isoformat(),
+                        "source_sheet": sheet,
+                    }
+                )
+
+    return {
+        "members": members,
+        "contributions": contributions,
+        "reports": reports,
+        "depenses": depenses,
+        "default_inscription": default_inscription,
+        "xl_sheet_names": xl.sheet_names,
+    }
+
+
+def apply_import_bundle(conn: sqlite3.Connection, bundle: dict[str, Any]) -> dict[str, int]:
+    """Écrit en base après validation. Retourne des compteurs."""
+    members: dict[MemberImportUid, dict[str, str]] = bundle["members"]
+    contributions: list[dict[str, object]] = bundle["contributions"]
+    reports: list[dict[str, object]] = bundle["reports"]
+    depenses_rows: list[dict[str, object]] = bundle["depenses"]
+    default_inscription: date = bundle["default_inscription"]
+
+    db_key_to_id = load_existing_member_keys(conn)
+    uid_to_id: dict[MemberImportUid, int] = {}
+    created = 0
+    for uid, info in members.items():
+        dk = excel_member_key(info["nom"], info["prenom"], info["telephone"])
+        if dk in db_key_to_id:
+            uid_to_id[uid] = db_key_to_id[dk]
+            continue
+        mid = insert_membre_from_import(
+            conn,
+            info["nom"],
+            info["prenom"],
+            info["telephone"],
+            info["village_origine"],
+            info["prefecture"],
+            info["email"],
+            info["adresse"],
+            default_inscription,
+        )
+        db_key_to_id[dk] = mid
+        uid_to_id[uid] = mid
+        created += 1
+
+    contrib_ins = 0
+    contrib_skip = 0
+    for c in contributions:
+        uid = c["member_uid"]
+        if uid not in uid_to_id:
+            contrib_skip += 1
+            continue
+        mid = uid_to_id[uid]
+        note = str(c["note"])
+        montant = float(c["montant"])
+        date_iso = str(c["date_iso"])
+        if contribution_exists(conn, mid, date_iso, montant, note):
+            contrib_skip += 1
+            continue
+        conn.execute(
+            "INSERT INTO contributions(membre_id, montant, date, note) VALUES(?, ?, ?, ?)",
+            (mid, montant, date_iso, note),
+        )
+        contrib_ins += 1
+
+    dep_ins = 0
+    dep_skip = 0
+    for d in depenses_rows:
+        desc = str(d["description"])
+        montant = float(d["montant"])
+        date_iso = str(d["date_iso"])
+        if depense_exists(conn, desc, date_iso, montant):
+            dep_skip += 1
+            continue
+        conn.execute(
+            "INSERT INTO depenses(description, montant, date) VALUES(?, ?, ?)",
+            (desc, montant, date_iso),
+        )
+        dep_ins += 1
+
+    rep_ins = 0
+    for r in reports:
+        uid = r["member_uid"]
+        if uid not in uid_to_id:
+            continue
+        mid = uid_to_id[uid]
+        annee = int(r["report_annee"])
+        amt = float(r["montant_du"])
+        conn.execute(
+            """
+            INSERT INTO reports_membres(membre_id, annee, montant_du)
+            VALUES(?, ?, ?)
+            ON CONFLICT(membre_id, annee) DO UPDATE SET montant_du = excluded.montant_du;
+            """,
+            (mid, annee, amt),
+        )
+        rep_ins += 1
+
+    log_activity(
+        conn,
+        type_operation="CREATE",
+        entite="import_excel",
+        entite_id=None,
+        details=(
+            f"Import Excel applique: membres_crees={created}, contributions={contrib_ins} "
+            f"(ignores {contrib_skip}), depenses={dep_ins} (ignores {dep_skip}), reports={rep_ins}"
+        ),
+    )
+    conn.commit()
+    return {
+        "membres_crees": created,
+        "contributions": contrib_ins,
+        "contributions_ignorees": contrib_skip,
+        "depenses": dep_ins,
+        "depenses_ignorees": dep_skip,
+        "reports": rep_ins,
+    }
+
+
+def page_import_excel(conn: sqlite3.Connection) -> None:
+    st.subheader("Import Excel")
+    st.caption(
+        "Feuilles attendues : « Cotisations AAAA » (en-tête membres ligne 4) et « Dépenses AAAA » "
+        "(en-tête ligne 3). Aperçu obligatoire avant écriture dans la base."
+    )
+
+    up = st.file_uploader("Fichier Excel (.xlsx)", type=["xlsx"])
+    default_date_ins = st.date_input(
+        "Date d'inscription pour les nouveaux membres créés par l'import",
+        value=date(date.today().year, 1, 1),
+        key="import_default_inscription",
+    )
+    import_reports = st.checkbox(
+        "Importer les colonnes « Solde YYYY » comme report membre (montant dû pour l'année YYYY+1 ; "
+        "valeurs négatives Excel = retard converti en montant positif)",
+        value=False,
+    )
+    st.session_state.setdefault("_import_bundle", None)
+
+    if not up:
+        st.info("Chargez le classeur AGPM (ex. AGPM Association_2026.xlsx).")
+        return
+
+    raw = up.getvalue()
+    try:
+        xl_names = pd.ExcelFile(BytesIO(raw), engine="openpyxl").sheet_names
+    except Exception as e:
+        st.error(f"Lecture du fichier impossible : {e}")
+        return
+
+    cotisation_candidates = [n for n in xl_names if cotisation_sheet_year(n) is not None]
+    depense_candidates = [n for n in xl_names if depenses_sheet_year(n) is not None]
+
+    c_sel = st.multiselect(
+        "Feuilles cotisations à importer",
+        options=sorted(cotisation_candidates),
+        default=sorted(cotisation_candidates),
+    )
+    d_sel = st.multiselect(
+        "Feuilles dépenses à importer",
+        options=sorted(depense_candidates),
+        default=sorted(depense_candidates),
+    )
+
+    if st.button("Préparer l'aperçu", type="primary"):
+        try:
+            bundle = parse_workbook_preview(
+                raw,
+                list(c_sel),
+                list(d_sel),
+                import_reports,
+                default_date_ins,
+            )
+            st.session_state["_import_bundle"] = bundle
+        except Exception as e:
+            st.session_state["_import_bundle"] = None
+            st.exception(e)
+
+    bundle = st.session_state.get("_import_bundle")
+    if not bundle:
+        return
+
+    existing = load_existing_member_keys(conn)
+    members_dict: dict[MemberImportUid, dict[str, str]] = bundle["members"]
+    rows_mem = []
+    for uid, info in sorted(members_dict.items(), key=lambda x: (x[1]["nom"], x[1]["prenom"], str(x[0]))):
+        dk = excel_member_key(info["nom"], info["prenom"], info["telephone"])
+        rows_mem.append(
+            {
+                "_uid_json": uid_import_to_json(uid),
+                "origine_ligne": member_import_row_label(uid),
+                "nouveau": "Oui" if dk not in existing else "Non",
+                "id_existant": str(existing[dk]) if dk in existing else "",
+                "nom": info["nom"],
+                "prenom": info["prenom"],
+                "telephone": info["telephone"] if info["telephone"] else "",
+                "email": info["email"],
+                "prefecture": info["prefecture"],
+            }
+        )
+    df_mem = pd.DataFrame(rows_mem)
+
+    st.markdown("### Contacts à importer — complétez les téléphones si besoin")
+    st.caption(
+        "Sans numéro dans Excel, chaque ligne de cotisation reste une entrée distincte (homonymes non fusionnés). "
+        "Renseignez le téléphone ci-dessous puis fusionnez les doublons, avant d'écrire en base."
+    )
+    edited_mem = st.data_editor(
+        df_mem,
+        column_config={
+            "_uid_json": st.column_config.TextColumn("UID", disabled=True, width="small"),
+            "origine_ligne": st.column_config.TextColumn("Source Excel", disabled=True),
+            "nouveau": st.column_config.TextColumn("Nouveau ?", disabled=True),
+            "id_existant": st.column_config.TextColumn("Id base", disabled=True),
+            "nom": st.column_config.TextColumn("Nom", disabled=True),
+            "prenom": st.column_config.TextColumn("Prénom", disabled=True),
+            "telephone": st.column_config.TextColumn("Téléphone", required=True),
+            "email": st.column_config.TextColumn("Email", disabled=True),
+            "prefecture": st.column_config.TextColumn("Préfecture", disabled=True),
+        },
+        hide_index=True,
+        num_rows="fixed",
+        use_container_width=True,
+        key="import_editor_membres",
+    )
+
+    if st.button("Appliquer téléphones et fusionner les doublons", type="secondary"):
+        sync_member_phones_from_editor(bundle, edited_mem)
+        collapse_bundle_members_by_phone(bundle)
+        st.session_state["_import_bundle"] = bundle
+        st.rerun()
+    st.caption(
+        "Après saisie des numéros : utilisez ce bouton pour regrouper les fiches identiques "
+        "(même nom, prénom et téléphone). L'enregistrement en base synchronise aussi les champs depuis le tableau."
+    )
+
+    cdf = pd.DataFrame(bundle["contributions"])
+    if cdf.empty:
+        st.warning("Aucune cotisation mensuelle numérique détectée dans les feuilles sélectionnées.")
+    else:
+        st.markdown(f"### Aperçu — contributions ({len(cdf)} lignes)")
+        show_c = cdf.copy()
+
+        def _deja_membre(r: pd.Series) -> bool:
+            uid = r["member_uid"]
+            info = bundle["members"].get(uid)
+            if not info:
+                return False
+            dk = excel_member_key(info["nom"], info["prenom"], info["telephone"])
+            return dk in existing
+
+        show_c["telephone"] = show_c["member_uid"].apply(
+            lambda u: bundle["members"].get(u, {}).get("telephone", "")
+        )
+        show_c["deja_membre"] = show_c.apply(_deja_membre, axis=1)
+        show_c = show_c.drop(columns=["member_uid"], errors="ignore")
+        st.dataframe(show_c.head(500), use_container_width=True)
+        if len(show_c) > 500:
+            st.caption(f"Affichage tronqué : {len(show_c) - 500} lignes supplémentaires non affichées.")
+
+    ddf = pd.DataFrame(bundle["depenses"])
+    if not ddf.empty:
+        st.markdown(f"### Aperçu — dépenses ({len(ddf)} lignes)")
+        st.dataframe(ddf.head(300), use_container_width=True)
+
+    rdf = pd.DataFrame(bundle["reports"])
+    if import_reports:
+        if rdf.empty:
+            st.info("Aucune valeur « Solde » retenue (vide ou zéro après conversion).")
+        else:
+            st.markdown(f"### Aperçu — reports membres ({len(rdf)} lignes)")
+            st.dataframe(rdf.drop(columns=["member_uid"], errors="ignore").head(300), use_container_width=True)
+
+    st.markdown("### Validation")
+    if st.button("Écrire dans la base SQLite", type="primary"):
+        try:
+            sync_member_phones_from_editor(bundle, edited_mem)
+            collapse_bundle_members_by_phone(bundle)
+            manques = validate_bundle_phones(bundle)
+            if manques:
+                st.error(
+                    "Téléphone manquant pour les contacts suivants — complétez la colonne puis "
+                    "« Appliquer téléphones… » ou réessayez :\n\n"
+                    + "\n".join(f"- {m}" for m in manques[:40])
+                    + (f"\n… ({len(manques) - 40} autres)" if len(manques) > 40 else "")
+                )
+                st.session_state["_import_bundle"] = bundle
+            else:
+                counts = apply_import_bundle(conn, bundle)
+                st.success(
+                    f"Import terminé — membres créés : {counts['membres_crees']}, "
+                    f"cotisations : {counts['contributions']} (ignorées doublons : {counts['contributions_ignorees']}), "
+                    f"dépenses : {counts['depenses']} (ignorées : {counts['depenses_ignorees']}), "
+                    f"reports : {counts['reports']}."
+                )
+                st.session_state["_import_bundle"] = None
+        except Exception as e:
+            st.exception(e)
+
+
 def main() -> None:
     st.set_page_config(page_title="AGPM - Gestion Association", layout="wide")
     st.title("AGPM - Gestion de l'association")
@@ -880,7 +1640,10 @@ def main() -> None:
     conn = get_conn()
     init_db(conn)
 
-    menu = st.sidebar.radio("Navigation", ["Membres", "Contributions", "Dépenses", "Dashboard", "Activité"])
+    menu = st.sidebar.radio(
+        "Navigation",
+        ["Membres", "Contributions", "Dépenses", "Dashboard", "Activité", "Import Excel"],
+    )
     st.sidebar.info("Les calculs sont basés sur les transactions réelles, pas sur des cellules Excel.")
 
     if menu == "Membres":
@@ -891,6 +1654,8 @@ def main() -> None:
         page_depenses(conn)
     elif menu == "Activité":
         page_activite(conn)
+    elif menu == "Import Excel":
+        page_import_excel(conn)
     else:
         page_dashboard(conn)
 
