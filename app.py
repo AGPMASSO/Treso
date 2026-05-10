@@ -245,7 +245,23 @@ def get_members_status(conn: sqlite3.Connection, year: int, include_archived: bo
         """,
     )
     if members.empty:
-        return members
+        return pd.DataFrame(
+            columns=[
+                "id",
+                "reference",
+                "actif",
+                "nom",
+                "prenom",
+                "telephone",
+                "village_origine",
+                "email",
+                "montant_du",
+                "total_paye",
+                "attendu",
+                "reste",
+                "statut",
+            ]
+        )
 
     paid = fetch_df(
         conn,
