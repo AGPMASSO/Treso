@@ -468,9 +468,124 @@ def page_membres(conn: sqlite3.Connection) -> None:
         selected = st.selectbox("Membre à modifier", list(options.keys()))
         selected_id = options[selected]
         member_row = conn.execute(
-            "SELECT id, actif, reference, nom, prenom FROM membres WHERE id = ?",
+            """
+            SELECT id, actif, reference, nom, prenom, telephone, village_origine,
+                   adresse, prefecture, email, date_inscription
+            FROM membres WHERE id = ?
+            """,
             (selected_id,),
         ).fetchone()
+
+        if member_row:
+            st.markdown("#### Modifier les informations du membre")
+            try:
+                current_inscription = datetime.fromisoformat(member_row["date_inscription"]).date()
+            except (TypeError, ValueError):
+                current_inscription = date.today()
+
+            with st.form(f"edit_member_{selected_id}"):
+                e1, e2 = st.columns(2)
+                with e1:
+                    edit_nom = st.text_input(
+                        "Nom *",
+                        value=member_row["nom"] or "",
+                        key=f"edit_nom_{selected_id}",
+                    )
+                    edit_prenom = st.text_input(
+                        "Prénom *",
+                        value=member_row["prenom"] or "",
+                        key=f"edit_prenom_{selected_id}",
+                    )
+                    edit_telephone = st.text_input(
+                        "Téléphone",
+                        value=member_row["telephone"] or "",
+                        key=f"edit_tel_{selected_id}",
+                    )
+                    edit_village = st.text_input(
+                        "Village d'origine",
+                        value=member_row["village_origine"] or "",
+                        key=f"edit_village_{selected_id}",
+                    )
+                    edit_prefecture = st.text_input(
+                        "Préfecture",
+                        value=member_row["prefecture"] or "",
+                        key=f"edit_pref_{selected_id}",
+                    )
+                with e2:
+                    edit_email = st.text_input(
+                        "Email",
+                        value=member_row["email"] or "",
+                        key=f"edit_email_{selected_id}",
+                    )
+                    edit_adresse = st.text_input(
+                        "Adresse",
+                        value=member_row["adresse"] or "",
+                        key=f"edit_adresse_{selected_id}",
+                    )
+                    edit_inscription = st.date_input(
+                        "Date d'inscription",
+                        value=current_inscription,
+                        key=f"edit_inscription_{selected_id}",
+                    )
+
+                update_submitted = st.form_submit_button("Mettre à jour le membre")
+                if update_submitted:
+                    nom_v = edit_nom.strip()
+                    prenom_v = edit_prenom.strip()
+                    telephone_v = edit_telephone.strip()
+                    village_v = edit_village.strip()
+                    prefecture_v = edit_prefecture.strip()
+                    email_v = edit_email.strip()
+                    adresse_v = edit_adresse.strip()
+                    if not nom_v or not prenom_v:
+                        st.error("Nom et prénom sont obligatoires.")
+                    elif email_v and ("@" not in email_v or "." not in email_v.split("@")[-1]):
+                        st.error("Email invalide.")
+                    else:
+                        before = (
+                            f"nom={member_row['nom']}, prenom={member_row['prenom']}, "
+                            f"tel={member_row['telephone'] or ''}, village={member_row['village_origine'] or ''}, "
+                            f"prefecture={member_row['prefecture'] or ''}, email={member_row['email'] or ''}, "
+                            f"adresse={member_row['adresse'] or ''}, date_inscription={member_row['date_inscription']}"
+                        )
+                        conn.execute(
+                            """
+                            UPDATE membres
+                            SET nom = ?, prenom = ?, telephone = ?, village_origine = ?,
+                                adresse = ?, prefecture = ?, email = ?, date_inscription = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                nom_v,
+                                prenom_v,
+                                telephone_v,
+                                village_v,
+                                adresse_v,
+                                prefecture_v,
+                                email_v,
+                                to_iso(edit_inscription),
+                                selected_id,
+                            ),
+                        )
+                        after = (
+                            f"nom={nom_v}, prenom={prenom_v}, tel={telephone_v}, "
+                            f"village={village_v}, prefecture={prefecture_v}, email={email_v}, "
+                            f"adresse={adresse_v}, date_inscription={to_iso(edit_inscription)}"
+                        )
+                        log_activity(
+                            conn,
+                            type_operation="UPDATE",
+                            entite="membre",
+                            entite_id=selected_id,
+                            details=(
+                                f"Maj membre ref={member_row['reference']} | "
+                                f"avant: [{before}] | apres: [{after}]"
+                            ),
+                        )
+                        conn.commit()
+                        st.success("Informations du membre mises à jour.")
+                        st.rerun()
+
         if member_row and int(member_row["actif"]) == 1:
             if st.button("Archiver le membre", type="secondary"):
                 conn.execute("UPDATE membres SET actif = 0 WHERE id = ?", (selected_id,))
@@ -1451,8 +1566,24 @@ def apply_import_bundle(conn: sqlite3.Connection, bundle: dict[str, Any]) -> dic
     }
 
 
+def ensure_openpyxl_or_stop() -> None:
+    try:
+        import openpyxl  # noqa: F401
+    except ImportError:
+        st.error(
+            "**openpyxl** est nécessaire pour lire les fichiers Excel (.xlsx).\n\n"
+            "- **En local** : exécutez `python -m pip install openpyxl` "
+            "(ou `python -m pip install -r requirements.txt` à la racine du projet).\n\n"
+            "- **Sur Streamlit Community Cloud** : le fichier `requirements.txt` doit être "
+            "à la **racine du dépôt Git** lié à l’app (avec une ligne `openpyxl>=3.1.0`), "
+            "puis redémarrez l’app (**Manage app → Reboot**) ou refaites un déploiement."
+        )
+        st.stop()
+
+
 def page_import_excel(conn: sqlite3.Connection) -> None:
     st.subheader("Import Excel")
+    ensure_openpyxl_or_stop()
     st.caption(
         "Feuilles attendues : « Cotisations AAAA » (en-tête membres ligne 4) et « Dépenses AAAA » "
         "(en-tête ligne 3). Aperçu obligatoire avant écriture dans la base."
