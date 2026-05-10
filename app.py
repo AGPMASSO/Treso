@@ -620,20 +620,119 @@ def page_contributions(conn: sqlite3.Connection) -> None:
             st.success("Contribution enregistrée.")
 
     st.markdown("### Historique")
-    year = st.number_input("Année", min_value=2020, max_value=2100, value=date.today().year, step=1)
-    hist = fetch_df(
+
+    all_members = fetch_df(
         conn,
         """
-        SELECT c.id, c.date, m.nom, m.prenom, c.montant, c.note
-        FROM contributions c
-        JOIN membres m ON m.id = c.membre_id
-        WHERE strftime('%Y', c.date) = ?
-        ORDER BY c.date DESC, c.id DESC;
+        SELECT id, reference, nom, prenom, telephone, village_origine
+        FROM membres
+        ORDER BY nom, prenom;
         """,
-        (str(year),),
     )
-    st.dataframe(hist, use_container_width=True)
-    st.metric("Total contributions (année)", f"{total_contributions(conn, int(year)):.2f} EUR")
+    ALL_MEMBERS_LABEL = "Tous les membres"
+    hist_member_options: dict[str, Optional[int]] = {ALL_MEMBERS_LABEL: None}
+    for _, r in all_members.iterrows():
+        label = (
+            f"{r['reference']} | {r['nom']} {r['prenom']} | "
+            f"{r['village_origine'] or '-'} | {r['telephone'] or '-'}"
+        )
+        hist_member_options[label] = int(r["id"])
+
+    hist_col_year, hist_col_member, hist_col_search = st.columns([1, 2, 2])
+    with hist_col_year:
+        year = st.number_input(
+            "Année", min_value=2020, max_value=2100, value=date.today().year, step=1
+        )
+    with hist_col_member:
+        hist_member_label = st.selectbox(
+            "Membre",
+            list(hist_member_options.keys()),
+            index=0,
+            key="hist_member",
+        )
+    selected_member_id = hist_member_options[hist_member_label]
+    with hist_col_search:
+        hist_search = (
+            st.text_input(
+                "Rechercher (référence, nom, prénom, note)",
+                "",
+                key="hist_search",
+                placeholder="ex: M002, Doe, virement…",
+            )
+            .strip()
+            .lower()
+        )
+
+    if selected_member_id is None:
+        hist = fetch_df(
+            conn,
+            """
+            SELECT c.id, c.date, m.reference, m.nom, m.prenom, c.montant, c.note
+            FROM contributions c
+            JOIN membres m ON m.id = c.membre_id
+            WHERE strftime('%Y', c.date) = ?
+            ORDER BY c.date DESC, c.id DESC;
+            """,
+            (str(year),),
+        )
+    else:
+        hist = fetch_df(
+            conn,
+            """
+            SELECT c.id, c.date, m.reference, m.nom, m.prenom, c.montant, c.note
+            FROM contributions c
+            JOIN membres m ON m.id = c.membre_id
+            WHERE strftime('%Y', c.date) = ?
+              AND c.membre_id = ?
+            ORDER BY c.date DESC, c.id DESC;
+            """,
+            (str(year), selected_member_id),
+        )
+
+    if hist_search and not hist.empty:
+        mask = (
+            hist["reference"].astype(str).str.lower().str.contains(hist_search, na=False)
+            | hist["nom"].astype(str).str.lower().str.contains(hist_search, na=False)
+            | hist["prenom"].astype(str).str.lower().str.contains(hist_search, na=False)
+            | hist["note"].astype(str).str.lower().str.contains(hist_search, na=False)
+        )
+        hist = hist[mask]
+
+    if selected_member_id is None:
+        if hist_search:
+            st.caption(f"{len(hist)} ligne(s) correspondante(s).")
+        st.dataframe(hist, use_container_width=True, hide_index=True)
+        st.metric("Total contributions (année)", f"{total_contributions(conn, int(year)):.2f} EUR")
+    else:
+        member_info = next(
+            (
+                lbl
+                for lbl, mid in hist_member_options.items()
+                if mid == selected_member_id
+            ),
+            "",
+        )
+        st.markdown(f"**{member_info} — Exercice {int(year)}**")
+
+        total_paid = float(hist["montant"].sum()) if not hist.empty else 0.0
+        nb_contrib = int(len(hist))
+        last_date = hist["date"].max() if not hist.empty else "—"
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total payé", f"{total_paid:,.2f} EUR".replace(",", " "))
+        m2.metric("Nombre de cotisations", f"{nb_contrib}")
+        m3.metric("Dernière cotisation", str(last_date) if last_date else "—")
+
+        if hist_search:
+            st.caption(f"{len(hist)} ligne(s) correspondante(s).")
+        if hist.empty:
+            st.info("Aucune cotisation pour ce membre sur l'année sélectionnée.")
+        else:
+            st.dataframe(
+                hist[["id", "date", "montant", "note"]],
+                use_container_width=True,
+                hide_index=True,
+            )
 
     if not hist.empty:
         with st.expander("Corriger une contribution", expanded=False):
@@ -729,6 +828,25 @@ def page_contributions(conn: sqlite3.Connection) -> None:
     if status.empty:
         st.info("Aucun membre actif.")
     else:
+        status_search = (
+            st.text_input(
+                "Rechercher un membre (référence, nom, prénom, téléphone)",
+                "",
+                key="status_search",
+                placeholder="ex: M005, Diallo, 0612…",
+            )
+            .strip()
+            .lower()
+        )
+        if status_search:
+            mask = (
+                status["reference"].astype(str).str.lower().str.contains(status_search, na=False)
+                | status["nom"].astype(str).str.lower().str.contains(status_search, na=False)
+                | status["prenom"].astype(str).str.lower().str.contains(status_search, na=False)
+                | status["telephone"].astype(str).str.lower().str.contains(status_search, na=False)
+            )
+            status = status[mask]
+            st.caption(f"{len(status)} membre(s) correspondant(s).")
         st.dataframe(status, use_container_width=True)
 
 
@@ -1192,22 +1310,73 @@ def page_dashboard(conn: sqlite3.Connection) -> None:
 
 def page_activite(conn: sqlite3.Connection) -> None:
     st.subheader("Activité")
-    st.caption("Trace des derniers mouvements: cotisations, depenses et modifications.")
-    limit = st.selectbox("Nombre de derniers mouvements", [5, 10, 20, 50, 100], index=2)
+    st.caption("Trace des derniers mouvements : cotisations, dépenses et modifications.")
+
+    f_lim, f_search = st.columns([1, 2])
+    with f_lim:
+        limit = st.selectbox(
+            "Nombre de derniers mouvements",
+            [10, 20, 50, 100, 200, 500],
+            index=2,
+            key="activity_limit",
+        )
+    with f_search:
+        search = (
+            st.text_input(
+                "Rechercher (membre, référence, détails)",
+                "",
+                key="activity_search",
+                placeholder="ex: M003, Diallo, cotisation…",
+            )
+            .strip()
+            .lower()
+        )
+
     logs = fetch_df(
         conn,
         """
-        SELECT id, created_at, type_operation, entite, entite_id, details
-        FROM activites
-        ORDER BY id DESC
+        SELECT a.id,
+               a.created_at,
+               a.entite,
+               a.entite_id,
+               COALESCE(
+                   NULLIF(TRIM(mm.nom || ' ' || mm.prenom), ''),
+                   NULLIF(TRIM(mc.nom || ' ' || mc.prenom), ''),
+                   ''
+               ) AS nom_prenom,
+               a.details
+        FROM activites a
+        LEFT JOIN membres mm
+               ON a.entite IN ('membre', 'reports_membres')
+              AND mm.id = a.entite_id
+        LEFT JOIN contributions c
+               ON a.entite = 'contribution'
+              AND c.id = a.entite_id
+        LEFT JOIN membres mc
+               ON mc.id = c.membre_id
+        ORDER BY a.id DESC
         LIMIT ?;
         """,
         (int(limit),),
     )
+
+    if search and not logs.empty:
+        mask = (
+            logs["nom_prenom"].astype(str).str.lower().str.contains(search, na=False)
+            | logs["details"].astype(str).str.lower().str.contains(search, na=False)
+            | logs["entite"].astype(str).str.lower().str.contains(search, na=False)
+        )
+        logs = logs[mask]
+        st.caption(f"{len(logs)} mouvement(s) correspondant(s).")
+
     if logs.empty:
-        st.info("Aucun mouvement enregistre pour le moment.")
+        st.info("Aucun mouvement enregistré pour le moment.")
     else:
-        st.dataframe(logs, use_container_width=True)
+        st.dataframe(
+            logs[["id", "created_at", "entite", "entite_id", "nom_prenom", "details"]],
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 # --- Import Excel (structure classeur AGPM Association) ---------------------------------
