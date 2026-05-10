@@ -7,6 +7,7 @@ from datetime import date, datetime
 from io import BytesIO
 from typing import Any, Optional
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -421,42 +422,6 @@ def page_membres(conn: sqlite3.Connection) -> None:
             df = df[filt]
     st.dataframe(df, use_container_width=True)
 
-    status_year = st.number_input(
-        "Année pour statut/décompte membres",
-        min_value=2020,
-        max_value=2100,
-        value=date.today().year,
-        step=1,
-        key="members_status_year",
-    )
-    st.markdown("### Statut et décompte des membres")
-    status_df = get_members_status(conn, int(status_year), include_archived=True)
-    if view_mode == "Actifs":
-        status_df = status_df[status_df["actif"] == 1]
-    elif view_mode == "Archivés":
-        status_df = status_df[status_df["actif"] == 0]
-    status_df = status_df.copy()
-    status_df["etat"] = status_df["actif"].apply(lambda v: "Actif" if int(v) == 1 else "Archive")
-    st.dataframe(
-        status_df[
-            [
-                "reference",
-                "etat",
-                "nom",
-                "prenom",
-                "telephone",
-                "village_origine",
-                "email",
-                "montant_du",
-                "total_paye",
-                "attendu",
-                "reste",
-                "statut",
-            ]
-        ],
-        use_container_width=True,
-    )
-
     if not df.empty:
         options = {
             (
@@ -671,92 +636,93 @@ def page_contributions(conn: sqlite3.Connection) -> None:
     st.metric("Total contributions (année)", f"{total_contributions(conn, int(year)):.2f} EUR")
 
     if not hist.empty:
-        st.markdown("### Corriger une contribution")
-        row_options = {
-            f"id={int(r['id'])} | {r['date']} | {r['nom']} {r['prenom']} | {float(r['montant']):.2f} EUR": int(r["id"])
-            for _, r in hist.iterrows()
-        }
-        selected_label = st.selectbox("Contribution à corriger", list(row_options.keys()))
-        selected_id = row_options[selected_label]
-        row = conn.execute(
-            "SELECT id, membre_id, montant, date, note FROM contributions WHERE id = ?",
-            (selected_id,),
-        ).fetchone()
-        if row:
-            reverse_members = {v: k for k, v in member_options.items()}
-            default_member_label = reverse_members.get(int(row["membre_id"]), list(member_options.keys())[0])
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                edit_member = st.selectbox(
-                    "Membre (édition)",
-                    list(member_options.keys()),
-                    index=list(member_options.keys()).index(default_member_label),
-                    key=f"edit_member_{selected_id}",
-                )
-            with c2:
-                edit_amount = st.number_input(
-                    "Montant (édition)",
-                    min_value=0.01,
-                    value=float(row["montant"]),
-                    step=1.0,
-                    key=f"edit_amount_{selected_id}",
-                )
-            with c3:
-                edit_date = st.date_input(
-                    "Date (édition)",
-                    value=datetime.fromisoformat(row["date"]).date(),
-                    key=f"edit_date_{selected_id}",
-                )
-            with c4:
-                edit_note = st.text_input(
-                    "Note (édition)",
-                    value=row["note"] or "",
-                    key=f"edit_note_{selected_id}",
-                )
+        with st.expander("Corriger une contribution", expanded=False):
+            st.caption("Sélectionnez la ligne à modifier ou supprimer en cas d'erreur de saisie.")
+            row_options = {
+                f"id={int(r['id'])} | {r['date']} | {r['nom']} {r['prenom']} | {float(r['montant']):.2f} EUR": int(r["id"])
+                for _, r in hist.iterrows()
+            }
+            selected_label = st.selectbox("Contribution à corriger", list(row_options.keys()))
+            selected_id = row_options[selected_label]
+            row = conn.execute(
+                "SELECT id, membre_id, montant, date, note FROM contributions WHERE id = ?",
+                (selected_id,),
+            ).fetchone()
+            if row:
+                reverse_members = {v: k for k, v in member_options.items()}
+                default_member_label = reverse_members.get(int(row["membre_id"]), list(member_options.keys())[0])
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    edit_member = st.selectbox(
+                        "Membre (édition)",
+                        list(member_options.keys()),
+                        index=list(member_options.keys()).index(default_member_label),
+                        key=f"edit_member_{selected_id}",
+                    )
+                with c2:
+                    edit_amount = st.number_input(
+                        "Montant (édition)",
+                        min_value=0.01,
+                        value=float(row["montant"]),
+                        step=1.0,
+                        key=f"edit_amount_{selected_id}",
+                    )
+                with c3:
+                    edit_date = st.date_input(
+                        "Date (édition)",
+                        value=datetime.fromisoformat(row["date"]).date(),
+                        key=f"edit_date_{selected_id}",
+                    )
+                with c4:
+                    edit_note = st.text_input(
+                        "Note (édition)",
+                        value=row["note"] or "",
+                        key=f"edit_note_{selected_id}",
+                    )
 
-            b1, b2 = st.columns(2)
-            with b1:
-                if st.button("Mettre à jour la contribution", key=f"update_contrib_{selected_id}"):
-                    before = f"membre_id={row['membre_id']}, montant={float(row['montant']):.2f}, date={row['date']}, note={row['note'] or ''}"
-                    conn.execute(
-                        """
-                        UPDATE contributions
-                        SET membre_id = ?, montant = ?, date = ?, note = ?
-                        WHERE id = ?
-                        """,
-                        (
-                            member_options[edit_member],
-                            float(edit_amount),
-                            to_iso(edit_date),
-                            edit_note.strip(),
-                            selected_id,
-                        ),
-                    )
-                    after = (
-                        f"membre_id={member_options[edit_member]}, montant={float(edit_amount):.2f}, "
-                        f"date={to_iso(edit_date)}, note={edit_note.strip()}"
-                    )
-                    log_activity(
-                        conn,
-                        type_operation="UPDATE",
-                        entite="contribution",
-                        entite_id=selected_id,
-                        details=f"Maj cotisation id={selected_id} | avant: [{before}] | apres: [{after}]",
-                    )
-                    conn.commit()
-                    st.success("Contribution mise à jour.")
-            with b2:
-                if st.button("Supprimer la contribution", type="secondary", key=f"delete_contrib_{selected_id}"):
-                    conn.execute("DELETE FROM contributions WHERE id = ?", (selected_id,))
-                    log_activity(
-                        conn,
-                        type_operation="DELETE",
-                        entite="contribution",
-                        entite_id=selected_id,
-                        details=f"Suppression cotisation id={selected_id}",
-                    )
-                    conn.commit()
-                    st.success("Contribution supprimée.")
+                b1, b2 = st.columns(2)
+                with b1:
+                    if st.button("Mettre à jour la contribution", key=f"update_contrib_{selected_id}"):
+                        before = f"membre_id={row['membre_id']}, montant={float(row['montant']):.2f}, date={row['date']}, note={row['note'] or ''}"
+                        conn.execute(
+                            """
+                            UPDATE contributions
+                            SET membre_id = ?, montant = ?, date = ?, note = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                member_options[edit_member],
+                                float(edit_amount),
+                                to_iso(edit_date),
+                                edit_note.strip(),
+                                selected_id,
+                            ),
+                        )
+                        after = (
+                            f"membre_id={member_options[edit_member]}, montant={float(edit_amount):.2f}, "
+                            f"date={to_iso(edit_date)}, note={edit_note.strip()}"
+                        )
+                        log_activity(
+                            conn,
+                            type_operation="UPDATE",
+                            entite="contribution",
+                            entite_id=selected_id,
+                            details=f"Maj cotisation id={selected_id} | avant: [{before}] | apres: [{after}]",
+                        )
+                        conn.commit()
+                        st.success("Contribution mise à jour.")
+                with b2:
+                    if st.button("Supprimer la contribution", type="secondary", key=f"delete_contrib_{selected_id}"):
+                        conn.execute("DELETE FROM contributions WHERE id = ?", (selected_id,))
+                        log_activity(
+                            conn,
+                            type_operation="DELETE",
+                            entite="contribution",
+                            entite_id=selected_id,
+                            details=f"Suppression cotisation id={selected_id}",
+                        )
+                        conn.commit()
+                        st.success("Contribution supprimée.")
 
     st.markdown("### Statut des membres")
     status = get_members_status(conn, int(year))
@@ -764,18 +730,6 @@ def page_contributions(conn: sqlite3.Connection) -> None:
         st.info("Aucun membre actif.")
     else:
         st.dataframe(status, use_container_width=True)
-
-    st.markdown("### Report N-1 par membre")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        selected_member = st.selectbox("Membre", list(member_options.keys()), key="carry_member")
-    with c2:
-        carry_year = st.number_input("Année du report", min_value=2020, max_value=2100, value=date.today().year, step=1)
-    with c3:
-        carry_amount = st.number_input("Montant dû reporté", min_value=0.0, value=0.0, step=10.0)
-    if st.button("Enregistrer le report membre"):
-        upsert_member_report(conn, member_options[selected_member], int(carry_year), float(carry_amount))
-        st.success("Report membre enregistré.")
 
 
 def page_depenses(conn: sqlite3.Connection) -> None:
@@ -905,15 +859,22 @@ def page_depenses(conn: sqlite3.Connection) -> None:
 
 def page_dashboard(conn: sqlite3.Connection) -> None:
     st.subheader("Dashboard")
-    year = st.number_input("Année financière", min_value=2020, max_value=2100, value=date.today().year, step=1)
-    year = int(year)
+    st.caption("Vue d'ensemble financière de l'association.")
 
-    st.markdown("### Solde reporté de l'association")
-    current_report = get_association_report(conn, year)
-    new_report = st.number_input("Solde reporté (N-1 -> N)", value=float(current_report), step=10.0)
-    if st.button("Enregistrer le solde reporté"):
-        upsert_association_report(conn, year, float(new_report))
-        st.success("Solde reporté association enregistré.")
+    head_l, head_r = st.columns([3, 1])
+    with head_r:
+        year = int(
+            st.number_input(
+                "Année financière",
+                min_value=2020,
+                max_value=2100,
+                value=date.today().year,
+                step=1,
+                key="dashboard_year",
+            )
+        )
+    with head_l:
+        st.markdown(f"#### Exercice {year}")
 
     contrib = total_contributions(conn, year)
     dep = total_expenses(conn, year)
@@ -921,55 +882,312 @@ def page_dashboard(conn: sqlite3.Connection) -> None:
     report_n2 = get_association_report(conn, year - 1)
     solde = report + contrib - dep
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Contributions", f"{contrib:.2f} EUR")
-    c2.metric("Dépenses", f"{dep:.2f} EUR")
-    c3.metric("Report N-1", f"{report:.2f} EUR")
-    c4.metric("Solde actuel", f"{solde:.2f} EUR")
-    n1 = st.columns(1)[0]
-    n1.metric("Solde N-2", f"{report_n2:.2f} EUR")
+    contrib_prev = total_contributions(conn, year - 1)
+    dep_prev = total_expenses(conn, year - 1)
+    solde_prev = report_n2 + contrib_prev - dep_prev
 
-    graph_df = pd.DataFrame(
-        {
-            "categorie": ["Contributions", "Dépenses", "Report N-1", "Solde"],
-            "montant": [contrib, dep, report, solde],
-        }
-    ).set_index("categorie")
-    st.bar_chart(graph_df)
+    st.divider()
 
-    st.markdown("### Evolution mensuelle (année)")
-    monthly = fetch_df(
-        conn,
-        """
-        WITH months AS (
-            SELECT '01' m UNION ALL SELECT '02' UNION ALL SELECT '03' UNION ALL SELECT '04'
-            UNION ALL SELECT '05' UNION ALL SELECT '06' UNION ALL SELECT '07' UNION ALL SELECT '08'
-            UNION ALL SELECT '09' UNION ALL SELECT '10' UNION ALL SELECT '11' UNION ALL SELECT '12'
-        ),
-        c AS (
-            SELECT strftime('%m', date) m, SUM(montant) total
-            FROM contributions
-            WHERE strftime('%Y', date) = ?
-            GROUP BY strftime('%m', date)
-        ),
-        d AS (
-            SELECT strftime('%m', date) m, SUM(montant) total
-            FROM depenses
-            WHERE strftime('%Y', date) = ?
-            GROUP BY strftime('%m', date)
-        )
-        SELECT months.m AS mois,
-               COALESCE(c.total, 0) AS contributions,
-               COALESCE(d.total, 0) AS depenses
-        FROM months
-        LEFT JOIN c ON c.m = months.m
-        LEFT JOIN d ON d.m = months.m
-        ORDER BY months.m;
-        """,
-        (str(year), str(year)),
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(
+        "Contributions",
+        f"{contrib:,.2f} EUR".replace(",", " "),
+        delta=f"{(contrib - contrib_prev):+,.2f} EUR vs N-1".replace(",", " "),
     )
-    monthly["solde_net"] = monthly["contributions"] - monthly["depenses"]
-    st.line_chart(monthly.set_index("mois")[["contributions", "depenses", "solde_net"]])
+    k2.metric(
+        "Dépenses",
+        f"{dep:,.2f} EUR".replace(",", " "),
+        delta=f"{(dep - dep_prev):+,.2f} EUR vs N-1".replace(",", " "),
+        delta_color="inverse",
+    )
+    k3.metric(
+        "Report N-1",
+        f"{report:,.2f} EUR".replace(",", " "),
+        help=f"Solde N-2 (rappel) : {report_n2:,.2f} EUR".replace(",", " "),
+    )
+    k4.metric(
+        "Solde actuel",
+        f"{solde:,.2f} EUR".replace(",", " "),
+        delta=f"{(solde - solde_prev):+,.2f} EUR vs N-1".replace(",", " "),
+    )
+
+    st.divider()
+
+    tab_apercu, tab_evolution, tab_parametres = st.tabs(
+        ["Vue d'ensemble", "Évolution mensuelle", "Paramètres"]
+    )
+
+    with tab_apercu:
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.markdown("##### Répartition de l'exercice")
+            breakdown = pd.DataFrame(
+                {
+                    "categorie": ["Report N-1", "Contributions", "Dépenses"],
+                    "montant": [report, contrib, dep],
+                }
+            )
+            color_scale_breakdown = alt.Scale(
+                domain=["Report N-1", "Contributions", "Dépenses"],
+                range=["#94a3b8", "#16a34a", "#ef4444"],
+            )
+            base_bd = alt.Chart(breakdown).encode(
+                y=alt.Y("categorie:N", sort=["Contributions", "Dépenses", "Report N-1"], title=None),
+                x=alt.X("montant:Q", title="Montant (EUR)", axis=alt.Axis(format=",.0f")),
+                color=alt.Color("categorie:N", scale=color_scale_breakdown, legend=None),
+                tooltip=[
+                    alt.Tooltip("categorie:N", title="Catégorie"),
+                    alt.Tooltip("montant:Q", title="Montant", format=",.2f"),
+                ],
+            )
+            chart_bd = (
+                (
+                    base_bd.mark_bar(cornerRadiusEnd=4, height=28)
+                    + base_bd.mark_text(align="left", dx=6, color="#1f2937", fontWeight="bold").encode(
+                        text=alt.Text("montant:Q", format=",.2f")
+                    )
+                )
+                .properties(height=240)
+                .configure_view(strokeWidth=0)
+                .configure_axis(grid=False)
+            )
+            st.altair_chart(chart_bd, use_container_width=True)
+
+        with col_right:
+            st.markdown("##### Construction du solde")
+            waterfall = pd.DataFrame(
+                {
+                    "etape": ["Report N-1", "Contributions", "Dépenses", "Solde"],
+                    "montant": [report, contrib, -dep, solde],
+                    "type": ["Report", "Apport", "Sortie", "Solde"],
+                }
+            )
+            color_scale_wf = alt.Scale(
+                domain=["Report", "Apport", "Sortie", "Solde"],
+                range=["#94a3b8", "#16a34a", "#ef4444", "#2563eb"],
+            )
+            base_wf = alt.Chart(waterfall).encode(
+                x=alt.X(
+                    "etape:N",
+                    sort=["Report N-1", "Contributions", "Dépenses", "Solde"],
+                    title=None,
+                    axis=alt.Axis(labelAngle=0),
+                ),
+                y=alt.Y("montant:Q", title="Montant (EUR)", axis=alt.Axis(format=",.0f")),
+                color=alt.Color("type:N", scale=color_scale_wf, legend=None),
+                tooltip=[
+                    alt.Tooltip("etape:N", title="Étape"),
+                    alt.Tooltip("montant:Q", title="Montant", format=",.2f"),
+                ],
+            )
+            chart_wf = (
+                (
+                    base_wf.mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4, size=42)
+                    + base_wf.mark_text(
+                        align="center",
+                        baseline="bottom",
+                        dy=-4,
+                        color="#1f2937",
+                        fontWeight="bold",
+                    ).encode(text=alt.Text("montant:Q", format=",.2f"))
+                )
+                .properties(height=240)
+                .configure_view(strokeWidth=0)
+                .configure_axis(grid=False)
+            )
+            st.altair_chart(chart_wf, use_container_width=True)
+
+        st.markdown("##### Synthèse N / N-1")
+        synth = pd.DataFrame(
+            [
+                {
+                    "Indicateur": "Contributions",
+                    f"Année {year}": f"{contrib:,.2f} EUR".replace(",", " "),
+                    f"Année {year - 1}": f"{contrib_prev:,.2f} EUR".replace(",", " "),
+                    "Variation": f"{(contrib - contrib_prev):+,.2f} EUR".replace(",", " "),
+                },
+                {
+                    "Indicateur": "Dépenses",
+                    f"Année {year}": f"{dep:,.2f} EUR".replace(",", " "),
+                    f"Année {year - 1}": f"{dep_prev:,.2f} EUR".replace(",", " "),
+                    "Variation": f"{(dep - dep_prev):+,.2f} EUR".replace(",", " "),
+                },
+                {
+                    "Indicateur": "Solde",
+                    f"Année {year}": f"{solde:,.2f} EUR".replace(",", " "),
+                    f"Année {year - 1}": f"{solde_prev:,.2f} EUR".replace(",", " "),
+                    "Variation": f"{(solde - solde_prev):+,.2f} EUR".replace(",", " "),
+                },
+            ]
+        )
+        st.dataframe(synth, use_container_width=True, hide_index=True)
+
+    with tab_evolution:
+        st.markdown("##### Contributions et dépenses par mois")
+        monthly = fetch_df(
+            conn,
+            """
+            WITH months AS (
+                SELECT '01' m UNION ALL SELECT '02' UNION ALL SELECT '03' UNION ALL SELECT '04'
+                UNION ALL SELECT '05' UNION ALL SELECT '06' UNION ALL SELECT '07' UNION ALL SELECT '08'
+                UNION ALL SELECT '09' UNION ALL SELECT '10' UNION ALL SELECT '11' UNION ALL SELECT '12'
+            ),
+            c AS (
+                SELECT strftime('%m', date) m, SUM(montant) total
+                FROM contributions
+                WHERE strftime('%Y', date) = ?
+                GROUP BY strftime('%m', date)
+            ),
+            d AS (
+                SELECT strftime('%m', date) m, SUM(montant) total
+                FROM depenses
+                WHERE strftime('%Y', date) = ?
+                GROUP BY strftime('%m', date)
+            )
+            SELECT months.m AS mois,
+                   COALESCE(c.total, 0) AS contributions,
+                   COALESCE(d.total, 0) AS depenses
+            FROM months
+            LEFT JOIN c ON c.m = months.m
+            LEFT JOIN d ON d.m = months.m
+            ORDER BY months.m;
+            """,
+            (str(year), str(year)),
+        )
+        monthly["solde_net"] = monthly["contributions"] - monthly["depenses"]
+        monthly["cumul_contributions"] = monthly["contributions"].cumsum()
+        monthly["cumul_depenses"] = monthly["depenses"].cumsum()
+        monthly["cumul_solde"] = monthly["cumul_contributions"] - monthly["cumul_depenses"]
+
+        month_labels_short = [
+            "Jan", "Fév", "Mar", "Avr", "Mai", "Juin",
+            "Juil", "Août", "Sep", "Oct", "Nov", "Déc",
+        ]
+        monthly["mois_label"] = monthly["mois"].apply(
+            lambda m: month_labels_short[int(m) - 1] if pd.notna(m) else ""
+        )
+        month_order = month_labels_short
+
+        flux_df = monthly.melt(
+            id_vars=["mois_label"],
+            value_vars=["contributions", "depenses"],
+            var_name="serie",
+            value_name="montant",
+        )
+        flux_df["serie"] = flux_df["serie"].map(
+            {"contributions": "Contributions", "depenses": "Dépenses"}
+        )
+        color_flux = alt.Scale(
+            domain=["Contributions", "Dépenses"], range=["#16a34a", "#ef4444"]
+        )
+
+        bars = (
+            alt.Chart(flux_df)
+            .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+            .encode(
+                x=alt.X(
+                    "mois_label:N",
+                    sort=month_order,
+                    title="Mois",
+                    axis=alt.Axis(labelAngle=0),
+                ),
+                xOffset=alt.XOffset("serie:N", sort=["Contributions", "Dépenses"]),
+                y=alt.Y("montant:Q", title="Montant (EUR)", axis=alt.Axis(format=",.0f")),
+                color=alt.Color(
+                    "serie:N",
+                    scale=color_flux,
+                    legend=alt.Legend(title=None, orient="top"),
+                ),
+                tooltip=[
+                    alt.Tooltip("mois_label:N", title="Mois"),
+                    alt.Tooltip("serie:N", title="Type"),
+                    alt.Tooltip("montant:Q", title="Montant", format=",.2f"),
+                ],
+            )
+        )
+        line_solde = (
+            alt.Chart(monthly)
+            .mark_line(color="#2563eb", strokeWidth=2.5, point=alt.OverlayMarkDef(filled=True, size=70))
+            .encode(
+                x=alt.X("mois_label:N", sort=month_order),
+                y=alt.Y("solde_net:Q"),
+                tooltip=[
+                    alt.Tooltip("mois_label:N", title="Mois"),
+                    alt.Tooltip("solde_net:Q", title="Solde net", format=",.2f"),
+                ],
+            )
+        )
+        chart_flux = (
+            (bars + line_solde)
+            .properties(height=320)
+            .configure_view(strokeWidth=0)
+            .configure_axis(grid=True, gridOpacity=0.25)
+        )
+        st.altair_chart(chart_flux, use_container_width=True)
+        st.caption("Barres : flux mensuels — Ligne bleue : solde net (contributions − dépenses).")
+
+        st.markdown("##### Cumul depuis janvier")
+        cumul_df = monthly.melt(
+            id_vars=["mois_label"],
+            value_vars=["cumul_contributions", "cumul_depenses", "cumul_solde"],
+            var_name="serie",
+            value_name="montant",
+        )
+        cumul_df["serie"] = cumul_df["serie"].map(
+            {
+                "cumul_contributions": "Contributions cumulées",
+                "cumul_depenses": "Dépenses cumulées",
+                "cumul_solde": "Solde cumulé",
+            }
+        )
+        color_cumul = alt.Scale(
+            domain=["Contributions cumulées", "Dépenses cumulées", "Solde cumulé"],
+            range=["#16a34a", "#ef4444", "#2563eb"],
+        )
+        chart_cumul = (
+            alt.Chart(cumul_df)
+            .mark_area(opacity=0.35, line={"strokeWidth": 2})
+            .encode(
+                x=alt.X(
+                    "mois_label:N",
+                    sort=month_order,
+                    title="Mois",
+                    axis=alt.Axis(labelAngle=0),
+                ),
+                y=alt.Y("montant:Q", title="Montant cumulé (EUR)", axis=alt.Axis(format=",.0f"), stack=None),
+                color=alt.Color(
+                    "serie:N",
+                    scale=color_cumul,
+                    legend=alt.Legend(title=None, orient="top"),
+                ),
+                tooltip=[
+                    alt.Tooltip("mois_label:N", title="Mois"),
+                    alt.Tooltip("serie:N", title="Série"),
+                    alt.Tooltip("montant:Q", title="Cumul", format=",.2f"),
+                ],
+            )
+            .properties(height=280)
+            .configure_view(strokeWidth=0)
+            .configure_axis(grid=True, gridOpacity=0.25)
+        )
+        st.altair_chart(chart_cumul, use_container_width=True)
+
+    with tab_parametres:
+        st.markdown("##### Solde reporté de l'association")
+        st.caption(
+            "Solde repris de l'année précédente vers l'exercice en cours. "
+            "Cette valeur alimente le KPI « Report N-1 » et le solde global."
+        )
+        new_report = st.number_input(
+            f"Solde reporté (N-1 → {year})",
+            value=float(report),
+            step=10.0,
+            key=f"dashboard_report_{year}",
+        )
+        if st.button("Enregistrer le solde reporté", type="primary"):
+            upsert_association_report(conn, year, float(new_report))
+            st.success("Solde reporté association enregistré.")
+            st.rerun()
 
 
 def page_activite(conn: sqlite3.Connection) -> None:
