@@ -25,6 +25,52 @@ def member_ref_label(reference: str, nom: str, prenom: str, village: str, teleph
     return f"{reference} | {nom} {prenom} | {village_safe} | {tel_safe}"
 
 
+def fmt_v(value: object) -> str:
+    """Formate une valeur pour les libellés d'activité ; renvoie '-' si vide/None."""
+    if value is None:
+        return "-"
+    s = str(value).strip()
+    return s if s else "-"
+
+
+def fmt_member_compact(
+    reference: str = "",
+    nom: str = "",
+    prenom: str = "",
+    telephone: str = "",
+    village: str = "",
+    prefecture: str = "",
+    email: str = "",
+    adresse: str = "",
+    date_inscription: str = "",
+) -> str:
+    """Représentation compacte d'un membre, sans labels (ref nom prenom tel village pref email adresse date)."""
+    parts = [
+        (reference or "").strip(),
+        (nom or "").strip(),
+        (prenom or "").strip(),
+        fmt_v(telephone),
+        fmt_v(village),
+        fmt_v(prefecture),
+        fmt_v(email),
+        fmt_v(adresse),
+        fmt_v(date_inscription),
+    ]
+    return " ".join(p for p in parts if p).strip()
+
+
+def fmt_contribution_compact(montant: float, date_iso: str, note: str = "") -> str:
+    """Représentation compacte d'une cotisation (sans labels)."""
+    base = f"{float(montant):.2f} EUR {fmt_v(date_iso)}"
+    n = (note or "").strip()
+    return f"{base} {n}" if n else base
+
+
+def fmt_depense_compact(description: str, montant: float, date_iso: str) -> str:
+    """Représentation compacte d'une dépense (sans labels)."""
+    return f"{fmt_v(description)} {float(montant):.2f} EUR {fmt_v(date_iso)}"
+
+
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -167,7 +213,7 @@ def upsert_association_report(conn: sqlite3.Connection, year: int, amount: float
         type_operation="UPDATE",
         entite="reports_association",
         entite_id=year,
-        details=f"Solde reporte association annee {year} = {amount:.2f} EUR",
+        details=f"Solde report association {year} {amount:.2f} EUR",
     )
     conn.commit()
 
@@ -186,7 +232,7 @@ def upsert_member_report(conn: sqlite3.Connection, member_id: int, year: int, am
         type_operation="UPDATE",
         entite="reports_membres",
         entite_id=member_id,
-        details=f"Report membre id={member_id} annee {year} = {amount_due:.2f} EUR",
+        details=f"Solde N-1 membre {member_ref(member_id)} exercice {year} {amount_due:.2f} EUR",
     )
     conn.commit()
 
@@ -261,7 +307,7 @@ def get_members_status(conn: sqlite3.Connection, year: int, include_archived: bo
                 "telephone",
                 "village_origine",
                 "email",
-                "montant_du",
+                "solde_n1",
                 "total_paye",
                 "attendu",
                 "reste",
@@ -293,14 +339,14 @@ def get_members_status(conn: sqlite3.Connection, year: int, include_archived: bo
         carried, how="left", left_on="id", right_on="membre_id", suffixes=("", "_carry")
     )
     merged["total_paye"] = merged["total_paye"].fillna(0.0)
-    merged["montant_du"] = merged["montant_du"].fillna(0.0)
+    merged["solde_n1"] = merged["montant_du"].fillna(0.0)
     merged["date_inscription"] = pd.to_datetime(merged["date_inscription"], errors="coerce").dt.date
 
     expected = []
     for _, row in merged.iterrows():
         inscription = row["date_inscription"] if pd.notna(row["date_inscription"]) else date(year, 1, 1)
         months = expected_months_for_member(inscription, year)
-        expected.append(months * MONTHLY_CONTRIBUTION + float(row["montant_du"]))
+        expected.append(months * MONTHLY_CONTRIBUTION + float(row["solde_n1"]))
 
     merged["attendu"] = expected
     merged["reste"] = (merged["attendu"] - merged["total_paye"]).clip(lower=0)
@@ -317,13 +363,39 @@ def get_members_status(conn: sqlite3.Connection, year: int, include_archived: bo
             "telephone",
             "village_origine",
             "email",
-            "montant_du",
+            "solde_n1",
             "total_paye",
             "attendu",
             "reste",
             "statut",
         ]
     ]
+
+
+def get_member_report(conn: sqlite3.Connection, member_id: int, year: int) -> float:
+    row = conn.execute(
+        "SELECT montant_du FROM reports_membres WHERE membre_id = ? AND annee = ?",
+        (member_id, year),
+    ).fetchone()
+    return float(row["montant_du"]) if row else 0.0
+
+
+def status_display_df(status: pd.DataFrame) -> pd.DataFrame:
+    cols = {
+        "reference": "Référence",
+        "nom": "Nom",
+        "prenom": "Prénom",
+        "telephone": "Téléphone",
+        "village_origine": "Village",
+        "email": "Email",
+        "solde_n1": "Solde N-1",
+        "total_paye": "Payé",
+        "attendu": "Attendu",
+        "reste": "Reste",
+        "statut": "Statut",
+    }
+    keep = [c for c in cols if c in status.columns]
+    return status[keep].rename(columns=cols)
 
 
 def page_membres(conn: sqlite3.Connection) -> None:
@@ -363,9 +435,17 @@ def page_membres(conn: sqlite3.Connection) -> None:
                         type_operation="CREATE",
                         entite="membre",
                         entite_id=new_id,
-                        details=(
-                            f"Ajout membre ref={member_ref(new_id)} nom={nom} prenom={prenom} "
-                            f"village={village_origine or '-'} tel={telephone or '-'}"
+                        details="Ajout membre "
+                        + fmt_member_compact(
+                            reference=member_ref(new_id),
+                            nom=nom,
+                            prenom=prenom,
+                            telephone=telephone,
+                            village=village_origine,
+                            prefecture=prefecture,
+                            email=email,
+                            adresse=adresse,
+                            date_inscription=to_iso(date_inscription),
                         ),
                     )
                     conn.commit()
@@ -507,11 +587,16 @@ def page_membres(conn: sqlite3.Connection) -> None:
                     elif email_v and ("@" not in email_v or "." not in email_v.split("@")[-1]):
                         st.error("Email invalide.")
                     else:
-                        before = (
-                            f"nom={member_row['nom']}, prenom={member_row['prenom']}, "
-                            f"tel={member_row['telephone'] or ''}, village={member_row['village_origine'] or ''}, "
-                            f"prefecture={member_row['prefecture'] or ''}, email={member_row['email'] or ''}, "
-                            f"adresse={member_row['adresse'] or ''}, date_inscription={member_row['date_inscription']}"
+                        before = fmt_member_compact(
+                            reference=member_row["reference"],
+                            nom=member_row["nom"],
+                            prenom=member_row["prenom"],
+                            telephone=member_row["telephone"],
+                            village=member_row["village_origine"],
+                            prefecture=member_row["prefecture"],
+                            email=member_row["email"],
+                            adresse=member_row["adresse"],
+                            date_inscription=member_row["date_inscription"],
                         )
                         conn.execute(
                             """
@@ -532,24 +617,51 @@ def page_membres(conn: sqlite3.Connection) -> None:
                                 selected_id,
                             ),
                         )
-                        after = (
-                            f"nom={nom_v}, prenom={prenom_v}, tel={telephone_v}, "
-                            f"village={village_v}, prefecture={prefecture_v}, email={email_v}, "
-                            f"adresse={adresse_v}, date_inscription={to_iso(edit_inscription)}"
+                        after = fmt_member_compact(
+                            reference=member_row["reference"],
+                            nom=nom_v,
+                            prenom=prenom_v,
+                            telephone=telephone_v,
+                            village=village_v,
+                            prefecture=prefecture_v,
+                            email=email_v,
+                            adresse=adresse_v,
+                            date_inscription=to_iso(edit_inscription),
                         )
                         log_activity(
                             conn,
                             type_operation="UPDATE",
                             entite="membre",
                             entite_id=selected_id,
-                            details=(
-                                f"Maj membre ref={member_row['reference']} | "
-                                f"avant: [{before}] | apres: [{after}]"
-                            ),
+                            details=f"Maj membre {before}  ->  {after}",
                         )
                         conn.commit()
                         st.success("Informations du membre mises à jour.")
                         st.rerun()
+
+            st.markdown("#### Solde reporté N-1")
+            report_year = st.number_input(
+                "Exercice concerné",
+                min_value=2020,
+                max_value=2100,
+                value=date.today().year,
+                step=1,
+                key=f"member_report_year_{selected_id}",
+                help="Montant dû repris de l'année précédente pour cet exercice (comme la colonne Solde N-1 du classeur Excel).",
+            )
+            current_solde = get_member_report(conn, selected_id, int(report_year))
+            new_solde = st.number_input(
+                f"Solde N-1 (EUR, exercice {int(report_year)})",
+                min_value=0.0,
+                value=float(current_solde),
+                step=1.0,
+                format="%.2f",
+                key=f"member_solde_n1_{selected_id}_{int(report_year)}",
+            )
+            if st.button("Enregistrer le solde N-1", key=f"save_solde_n1_{selected_id}"):
+                upsert_member_report(conn, selected_id, int(report_year), float(new_solde))
+                st.success(f"Solde N-1 enregistré pour l'exercice {int(report_year)}.")
+                st.rerun()
 
         if member_row and int(member_row["actif"]) == 1:
             if st.button("Archiver le membre", type="secondary"):
@@ -559,7 +671,7 @@ def page_membres(conn: sqlite3.Connection) -> None:
                     type_operation="UPDATE",
                     entite="membre",
                     entite_id=selected_id,
-                    details=f"Archivage membre ref={member_row['reference']} nom={member_row['nom']} {member_row['prenom']}",
+                    details=f"Archivage membre {member_row['reference']} {member_row['nom']} {member_row['prenom']}",
                 )
                 conn.commit()
                 st.success("Membre archivé.")
@@ -571,10 +683,75 @@ def page_membres(conn: sqlite3.Connection) -> None:
                     type_operation="UPDATE",
                     entite="membre",
                     entite_id=selected_id,
-                    details=f"Reactivation membre ref={member_row['reference']} nom={member_row['nom']} {member_row['prenom']}",
+                    details=f"Reactivation membre {member_row['reference']} {member_row['nom']} {member_row['prenom']}",
                 )
                 conn.commit()
                 st.success("Membre réactivé.")
+
+    st.markdown("### Initialisation — Soldes N-1 par membre")
+    st.caption(
+        "Reprise du retard fin d'année précédente (colonne « Solde N-1 » du fichier Excel). "
+        "Ce montant s'ajoute aux cotisations attendues pour le calcul du statut."
+    )
+    init_year = st.number_input(
+        "Exercice",
+        min_value=2020,
+        max_value=2100,
+        value=date.today().year,
+        step=1,
+        key="bulk_solde_n1_year",
+    )
+    init_members = fetch_df(
+        conn,
+        """
+        SELECT id, reference, nom, prenom
+        FROM membres
+        WHERE actif = 1
+        ORDER BY nom, prenom;
+        """,
+    )
+    if init_members.empty:
+        st.info("Aucun membre actif.")
+    else:
+        init_rows = []
+        for _, r in init_members.iterrows():
+            mid = int(r["id"])
+            init_rows.append(
+                {
+                    "id": mid,
+                    "reference": r["reference"],
+                    "nom": r["nom"],
+                    "prenom": r["prenom"],
+                    "solde_n1": get_member_report(conn, mid, int(init_year)),
+                }
+            )
+        init_df = pd.DataFrame(init_rows)
+        edited_init = st.data_editor(
+            init_df,
+            column_config={
+                "id": st.column_config.NumberColumn("Id", disabled=True),
+                "reference": st.column_config.TextColumn("Référence", disabled=True),
+                "nom": st.column_config.TextColumn("Nom", disabled=True),
+                "prenom": st.column_config.TextColumn("Prénom", disabled=True),
+                "solde_n1": st.column_config.NumberColumn(
+                    f"Solde N-1 ({int(init_year)})",
+                    min_value=0.0,
+                    step=1.0,
+                    format="%.2f",
+                ),
+            },
+            hide_index=True,
+            num_rows="fixed",
+            use_container_width=True,
+            key=f"bulk_solde_editor_{int(init_year)}",
+        )
+        if st.button("Enregistrer tous les soldes N-1", type="primary", key="bulk_save_solde_n1"):
+            n_saved = 0
+            for _, row in edited_init.iterrows():
+                upsert_member_report(conn, int(row["id"]), int(init_year), float(row["solde_n1"]))
+                n_saved += 1
+            st.success(f"{n_saved} solde(s) N-1 enregistré(s) pour l'exercice {int(init_year)}.")
+            st.rerun()
 
 
 def page_contributions(conn: sqlite3.Connection) -> None:
@@ -612,8 +789,8 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                 entite="contribution",
                 entite_id=cur.lastrowid,
                 details=(
-                    f"Ajout cotisation id={cur.lastrowid}, membre_id={member_options[member_label]}, "
-                    f"montant={float(montant):.2f} EUR, date={to_iso(contribution_date)}"
+                    f"Ajout cotisation #{cur.lastrowid} {member_ref(member_options[member_label])} "
+                    + fmt_contribution_compact(float(montant), to_iso(contribution_date), note)
                 ),
             )
             conn.commit()
@@ -719,9 +896,16 @@ def page_contributions(conn: sqlite3.Connection) -> None:
         last_date = hist["date"].max() if not hist.empty else "—"
 
         m1, m2, m3 = st.columns(3)
+        member_status = get_members_status(conn, int(year)).query("id == @selected_member_id")
+        solde_n1 = float(member_status["solde_n1"].iloc[0]) if not member_status.empty else 0.0
+        attendu = float(member_status["attendu"].iloc[0]) if not member_status.empty else 0.0
+        reste = float(member_status["reste"].iloc[0]) if not member_status.empty else 0.0
+        statut = str(member_status["statut"].iloc[0]) if not member_status.empty else "—"
+
         m1.metric("Total payé", f"{total_paid:,.2f} EUR".replace(",", " "))
-        m2.metric("Nombre de cotisations", f"{nb_contrib}")
-        m3.metric("Dernière cotisation", str(last_date) if last_date else "—")
+        m2.metric("Solde N-1", f"{solde_n1:,.2f} EUR".replace(",", " "))
+        m3.metric("Attendu / Reste", f"{attendu:,.2f} / {reste:,.2f} EUR".replace(",", " "))
+        st.caption(f"Statut : **{statut}** — dernière cotisation : {last_date if last_date else '—'} ({nb_contrib} ligne(s))")
 
         if hist_search:
             st.caption(f"{len(hist)} ligne(s) correspondante(s).")
@@ -782,7 +966,10 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                 b1, b2 = st.columns(2)
                 with b1:
                     if st.button("Mettre à jour la contribution", key=f"update_contrib_{selected_id}"):
-                        before = f"membre_id={row['membre_id']}, montant={float(row['montant']):.2f}, date={row['date']}, note={row['note'] or ''}"
+                        before = (
+                            f"{member_ref(int(row['membre_id']))} "
+                            + fmt_contribution_compact(float(row["montant"]), str(row["date"]), row["note"] or "")
+                        )
                         conn.execute(
                             """
                             UPDATE contributions
@@ -798,15 +985,15 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                             ),
                         )
                         after = (
-                            f"membre_id={member_options[edit_member]}, montant={float(edit_amount):.2f}, "
-                            f"date={to_iso(edit_date)}, note={edit_note.strip()}"
+                            f"{member_ref(int(member_options[edit_member]))} "
+                            + fmt_contribution_compact(float(edit_amount), to_iso(edit_date), edit_note.strip())
                         )
                         log_activity(
                             conn,
                             type_operation="UPDATE",
                             entite="contribution",
                             entite_id=selected_id,
-                            details=f"Maj cotisation id={selected_id} | avant: [{before}] | apres: [{after}]",
+                            details=f"Maj cotisation #{selected_id} {before}  ->  {after}",
                         )
                         conn.commit()
                         st.success("Contribution mise à jour.")
@@ -818,12 +1005,16 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                             type_operation="DELETE",
                             entite="contribution",
                             entite_id=selected_id,
-                            details=f"Suppression cotisation id={selected_id}",
+                            details=f"Suppression cotisation #{selected_id}",
                         )
                         conn.commit()
                         st.success("Contribution supprimée.")
 
     st.markdown("### Statut des membres")
+    st.caption(
+        f"Attendu = cotisations mensuelles ({MONTHLY_CONTRIBUTION:.0f} EUR/mois selon date d'inscription) "
+        f"+ solde N-1 reporté pour l'exercice {int(year)}."
+    )
     status = get_members_status(conn, int(year))
     if status.empty:
         st.info("Aucun membre actif.")
@@ -847,7 +1038,7 @@ def page_contributions(conn: sqlite3.Connection) -> None:
             )
             status = status[mask]
             st.caption(f"{len(status)} membre(s) correspondant(s).")
-        st.dataframe(status, use_container_width=True)
+        st.dataframe(status_display_df(status), use_container_width=True, hide_index=True)
 
 
 def page_depenses(conn: sqlite3.Connection) -> None:
@@ -871,7 +1062,10 @@ def page_depenses(conn: sqlite3.Connection) -> None:
                     type_operation="CREATE",
                     entite="depense",
                     entite_id=int(dep_id),
-                    details=f"Ajout depense id={int(dep_id)}, {description}, montant={float(montant):.2f} EUR, date={to_iso(depense_date)}",
+                    details=(
+                        f"Ajout depense #{int(dep_id)} "
+                        + fmt_depense_compact(description, float(montant), to_iso(depense_date))
+                    ),
                 )
                 conn.commit()
                 st.success("Dépense enregistrée.")
@@ -931,9 +1125,10 @@ def page_depenses(conn: sqlite3.Connection) -> None:
                     if not edit_dep_desc.strip():
                         st.error("Description obligatoire.")
                     else:
-                        before = (
-                            f"description={dep_row['description']}, montant={float(dep_row['montant']):.2f}, "
-                            f"date={dep_row['date']}"
+                        before = fmt_depense_compact(
+                            dep_row["description"] or "",
+                            float(dep_row["montant"]),
+                            str(dep_row["date"]),
                         )
                         conn.execute(
                             """
@@ -948,16 +1143,17 @@ def page_depenses(conn: sqlite3.Connection) -> None:
                                 selected_dep_id,
                             ),
                         )
-                        after = (
-                            f"description={edit_dep_desc.strip()}, montant={float(edit_dep_amount):.2f}, "
-                            f"date={to_iso(edit_dep_date)}"
+                        after = fmt_depense_compact(
+                            edit_dep_desc.strip(),
+                            float(edit_dep_amount),
+                            to_iso(edit_dep_date),
                         )
                         log_activity(
                             conn,
                             type_operation="UPDATE",
                             entite="depense",
                             entite_id=selected_dep_id,
-                            details=f"Maj depense id={selected_dep_id} | avant: [{before}] | apres: [{after}]",
+                            details=f"Maj depense #{selected_dep_id} {before}  ->  {after}",
                         )
                         conn.commit()
                         st.success("Dépense mise à jour.")
@@ -969,7 +1165,7 @@ def page_depenses(conn: sqlite3.Connection) -> None:
                         type_operation="DELETE",
                         entite="depense",
                         entite_id=selected_dep_id,
-                        details=f"Suppression depense id={selected_dep_id}",
+                        details=f"Suppression depense #{selected_dep_id}",
                     )
                     conn.commit()
                     st.success("Dépense supprimée.")
@@ -1396,7 +1592,8 @@ MONTH_ORDER_FR = [
     "decembre",
 ]
 
-SOLDE_COL_RE = re.compile(r"solde\s*(\d{4})", re.IGNORECASE)
+SOLDE_YEAR_IN_COL_RE = re.compile(r"solde\s*(\d{4})", re.IGNORECASE)
+SOLDE_N1_COL_RE = re.compile(r"^solde\s+n\s*[- ]?\s*1$", re.IGNORECASE)
 COTISATIONS_SHEET_RE = re.compile(r"^cotisations\s*(\d{4})$", re.IGNORECASE)
 DEPENSES_SHEET_RE = re.compile(r"^d[ée]penses\s*(\d{4})$", re.IGNORECASE)
 
@@ -1564,12 +1761,27 @@ def month_columns_from_df(df: pd.DataFrame) -> dict[int, str]:
     return mapping
 
 
-def solde_columns_from_df(df: pd.DataFrame) -> list[tuple[int, str]]:
+def solde_columns_from_df(df: pd.DataFrame, sheet_year: int) -> list[tuple[int, str]]:
+    """Colonnes solde Excel → (année d'exercice du report, nom de colonne).
+
+    - « Solde 2025 » sur feuille Cotisations 2026 → report pour l'exercice 2026.
+    - « Solde N-1 » → report pour l'année de la feuille (solde fin N-1 reprise en N).
+    """
     out: list[tuple[int, str]] = []
+    seen_years: set[int] = set()
     for c in df.columns:
-        m = SOLDE_COL_RE.search(str(c))
+        norm = normalize_header(c)
+        m = SOLDE_YEAR_IN_COL_RE.search(norm)
         if m:
-            out.append((int(m.group(1)), str(c)))
+            report_annee = int(m.group(1)) + 1
+        elif SOLDE_N1_COL_RE.match(norm):
+            report_annee = sheet_year
+        else:
+            continue
+        if report_annee in seen_years:
+            continue
+        seen_years.add(report_annee)
+        out.append((report_annee, str(c)))
     return out
 
 
@@ -1683,9 +1895,17 @@ def insert_membre_from_import(
         type_operation="CREATE",
         entite="membre",
         entite_id=new_id,
-        details=(
-            f"Import Excel ref={member_ref(new_id)} nom={nom.strip()} prenom={prenom.strip()} "
-            f"village={village_origine or '-'} tel={telephone or '-'}"
+        details="Import Excel "
+        + fmt_member_compact(
+            reference=member_ref(new_id),
+            nom=nom.strip(),
+            prenom=prenom.strip(),
+            telephone=telephone,
+            village=village_origine,
+            prefecture=prefecture,
+            email=email,
+            adresse=adresse,
+            date_inscription=to_iso(date_inscription),
         ),
     )
     return new_id
@@ -1735,7 +1955,7 @@ def parse_workbook_preview(
             continue
 
         month_cols = month_columns_from_df(df)
-        solde_cols = solde_columns_from_df(df) if import_reports else []
+        solde_cols = solde_columns_from_df(df, sheet_year) if import_reports else []
 
         for row_num, (_, row) in enumerate(df.iterrows(), start=1):
             nom_v = row[col_nom]
@@ -1789,8 +2009,7 @@ def parse_workbook_preview(
                 )
 
             if import_reports:
-                for solde_year, col_name in solde_cols:
-                    report_annee = solde_year + 1
+                for report_annee, col_name in solde_cols:
                     rep_amt = parse_solde_report_amount(row[col_name])
                     if rep_amt is None:
                         continue
@@ -1983,9 +2202,9 @@ def page_import_excel(conn: sqlite3.Connection) -> None:
         key="import_default_inscription",
     )
     import_reports = st.checkbox(
-        "Importer les colonnes « Solde YYYY » comme report membre (montant dû pour l'année YYYY+1 ; "
-        "valeurs négatives Excel = retard converti en montant positif)",
-        value=False,
+        "Importer les colonnes « Solde N-1 » / « Solde YYYY » (retard repris sur l'exercice ; "
+        "valeurs négatives Excel = montant dû positif)",
+        value=True,
     )
     st.session_state.setdefault("_import_bundle", None)
 
