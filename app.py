@@ -11,7 +11,18 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-DB_PATH = "agpm.db"
+from persistence import (
+    PersistingConnection,
+    bootstrap_local_database,
+    clear_bootstrap_cache,
+    get_persistence_config,
+    is_ephemeral_streamlit_host,
+    local_db_path,
+    persistence_is_configured,
+    push_db_to_cloud,
+    restore_database_file,
+)
+
 MONTHLY_CONTRIBUTION = 10.0
 
 
@@ -71,11 +82,86 @@ def fmt_depense_compact(description: str, montant: float, date_iso: str) -> str:
     return f"{fmt_v(description)} {float(montant):.2f} EUR {fmt_v(date_iso)}"
 
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
+@st.cache_resource
+def get_conn() -> PersistingConnection:
+    db_file = bootstrap_local_database()
+    raw = sqlite3.connect(db_file, check_same_thread=False)
+    raw.row_factory = sqlite3.Row
+    raw.execute("PRAGMA foreign_keys = ON;")
+    conn = PersistingConnection(raw, db_file)
+    init_db(conn)
     return conn
+
+
+def reset_database_cache() -> None:
+    clear_bootstrap_cache()
+    get_conn.clear()
+
+
+def render_storage_sidebar() -> None:
+    with st.sidebar.expander("Sauvegarde des données", expanded=not persistence_is_configured()):
+        cfg = get_persistence_config()
+        pull_err = st.session_state.get("_persistence_pull_error")
+        push_err = st.session_state.get("_persistence_push_error")
+
+        if cfg:
+            st.success("Stockage cloud actif — les données survivent aux redémarrages.")
+            st.caption(f"Bucket : `{cfg['bucket']}` / `{cfg.get('key', 'agpm.db')}`")
+        elif is_ephemeral_streamlit_host():
+            st.error(
+                "Sur Streamlit Cloud, le fichier `agpm.db` local est **effacé** à chaque redémarrage. "
+                "Configurez un stockage cloud (voir ci-dessous) pour conserver vos données."
+            )
+        else:
+            st.info(
+                "En local, les données sont dans `agpm.db`. Sur Streamlit Cloud, ajoutez les secrets "
+                "de persistance (fichier `.streamlit/secrets.toml.example` dans le dépôt)."
+            )
+
+        if pull_err:
+            st.warning(f"Dernier chargement cloud : {pull_err}")
+        if push_err:
+            st.warning(f"Dernière sauvegarde cloud : {push_err}")
+
+        db_path = local_db_path()
+        if db_path.is_file():
+            st.download_button(
+                "Télécharger la base (agpm.db)",
+                data=db_path.read_bytes(),
+                file_name="agpm.db",
+                mime="application/octet-stream",
+                use_container_width=True,
+            )
+        else:
+            st.caption("Aucun fichier de base local pour le moment.")
+
+        uploaded = st.file_uploader("Restaurer une sauvegarde .db", type=["db"])
+        if uploaded is not None and st.button("Appliquer la restauration", use_container_width=True):
+            restore_database_file(uploaded.getvalue())
+            reset_database_cache()
+            st.success("Base restaurée. Rechargement…")
+            st.rerun()
+
+        if cfg and db_path.is_file() and st.button("Forcer l'envoi vers le cloud", use_container_width=True):
+            try:
+                push_db_to_cloud(cfg, db_path)
+                st.session_state.pop("_persistence_push_error", None)
+                st.success("Sauvegarde cloud mise à jour.")
+            except Exception as exc:
+                st.error(str(exc))
+
+        with st.expander("Configurer Cloudflare R2 (gratuit)"):
+            st.markdown(
+                """
+1. [Cloudflare](https://dash.cloudflare.com/) → **R2** → créer un bucket (ex. `agpm-gestion`).
+2. **Manage R2 API Tokens** → token avec lecture/écriture sur ce bucket.
+3. Sur [share.streamlit.io](https://share.streamlit.io/) → votre app → **Settings** → **Secrets** :
+   collez le contenu de `.streamlit/secrets.toml.example` en remplissant les clés.
+4. **Reboot** l'application.
+
+Les modifications sont enregistrées automatiquement après chaque action dans l'app.
+                """
+            )
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -2374,8 +2460,8 @@ def main() -> None:
     st.title("AGPM - Gestion de l'association")
     st.caption("Cotisation mensuelle de référence: 10 EUR.")
 
+    render_storage_sidebar()
     conn = get_conn()
-    init_db(conn)
 
     menu = st.sidebar.radio(
         "Navigation",
