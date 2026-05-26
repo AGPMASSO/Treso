@@ -484,260 +484,282 @@ def status_display_df(status: pd.DataFrame) -> pd.DataFrame:
     return status[keep].rename(columns=cols)
 
 
-def page_membres(conn: sqlite3.Connection) -> None:
-    st.subheader("Membres")
-    with st.form("add_member", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            nom = st.text_input("Nom *").strip()
-            prenom = st.text_input("Prénom *").strip()
-            telephone = st.text_input("Téléphone").strip()
-            village_origine = st.text_input("Village d'origine").strip()
-            prefecture = st.text_input("Préfecture").strip()
-        with c2:
-            email = st.text_input("Email").strip()
-            adresse = st.text_input("Adresse").strip()
-            date_inscription = st.date_input("Date d'inscription", value=date.today())
+def format_eur(amount: float) -> str:
+    return f"{amount:,.2f} EUR".replace(",", " ")
 
-        submitted = st.form_submit_button("Ajouter")
-        if submitted:
-            if not nom or not prenom:
-                st.error("Nom et prénom sont obligatoires.")
-            elif email and ("@" not in email or "." not in email.split("@")[-1]):
-                st.error("Email invalide.")
-            else:
-                try:
-                    cur = conn.execute(
-                        """
-                        INSERT INTO membres(reference, nom, prenom, telephone, village_origine, adresse, prefecture, email, date_inscription, actif)
-                        VALUES('', ?, ?, ?, ?, ?, ?, ?, ?, 1);
-                        """,
-                        (nom, prenom, telephone, village_origine, adresse, prefecture, email, to_iso(date_inscription)),
+
+def member_pick_label(row: pd.Series) -> str:
+    reste = float(row.get("reste", 0))
+    statut = str(row.get("statut", ""))
+    icon = "⏳" if statut == "En retard" else "✅"
+    return (
+        f"{icon} {row['reference']} — {row['nom']} {row['prenom']} "
+        f"(reste {format_eur(reste)})"
+    )
+
+
+def filter_members_status(
+    status: pd.DataFrame,
+    search: str,
+    only_late: bool,
+) -> pd.DataFrame:
+    if status.empty:
+        return status
+    out = status.copy()
+    if only_late:
+        out = out[out["statut"] == "En retard"]
+    q = search.strip().lower()
+    if q:
+        mask = (
+            out["reference"].astype(str).str.lower().str.contains(q, na=False)
+            | out["nom"].astype(str).str.lower().str.contains(q, na=False)
+            | out["prenom"].astype(str).str.lower().str.contains(q, na=False)
+            | out["telephone"].astype(str).str.lower().str.contains(q, na=False)
+            | out["village_origine"].astype(str).str.lower().str.contains(q, na=False)
+        )
+        out = out[mask]
+    return out
+
+
+def sort_status_for_entry(status: pd.DataFrame) -> pd.DataFrame:
+    if status.empty:
+        return status
+    late_first = (status["statut"] != "En retard").astype(int)
+    return (
+        status.assign(_late=late_first)
+        .sort_values(["_late", "reste", "nom", "prenom"], ascending=[True, False, True, True])
+        .drop(columns="_late")
+        .reset_index(drop=True)
+    )
+
+
+def status_grid_dataframe(status: pd.DataFrame) -> pd.DataFrame:
+    """Tableau affiché : lisible, avec repères visuels pour le statut."""
+    if status.empty:
+        return pd.DataFrame()
+    view = status.copy()
+    view["statut"] = view["statut"].map({"A jour": "✅ À jour", "En retard": "⏳ En retard"}).fillna(view["statut"])
+    for col in ("solde_n1", "total_paye", "attendu", "reste"):
+        if col in view.columns:
+            view[col] = view[col].map(lambda x: round(float(x), 2))
+    return status_display_df(view)
+
+
+def insert_contribution(
+    conn: sqlite3.Connection,
+    member_id: int,
+    montant: float,
+    contribution_date: date,
+    note: str = "",
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO contributions(membre_id, montant, date, note) VALUES(?, ?, ?, ?)",
+        (member_id, float(montant), to_iso(contribution_date), note.strip()),
+    )
+    cid = int(cur.lastrowid)
+    log_activity(
+        conn,
+        type_operation="CREATE",
+        entite="contribution",
+        entite_id=cid,
+        details=(
+            f"Ajout cotisation #{cid} {member_ref(member_id)} "
+            + fmt_contribution_compact(float(montant), to_iso(contribution_date), note)
+        ),
+    )
+    conn.commit()
+    return cid
+
+
+def render_app_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .page-guide {
+            font-size: 0.95rem;
+            color: #475569;
+            margin: 0 0 0.75rem 0;
+            line-height: 1.45;
+        }
+        div[data-testid="stMetric"] {
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            padding: 0.35rem 0.75rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_page_guide(text: str) -> None:
+    st.markdown(f'<p class="page-guide">{text}</p>', unsafe_allow_html=True)
+
+
+def render_contributions_styles() -> None:
+    render_app_styles()
+
+
+def filter_df_search(df: pd.DataFrame, search: str, columns: list[str]) -> pd.DataFrame:
+    q = search.strip().lower()
+    if not q or df.empty:
+        return df
+    mask = pd.Series(False, index=df.index)
+    for col in columns:
+        if col in df.columns:
+            mask = mask | df[col].astype(str).str.lower().str.contains(q, na=False)
+    return df[mask]
+
+
+def member_row_label(reference: str, nom: str, prenom: str, extra: str = "") -> str:
+    base = f"{reference} — {nom} {prenom}"
+    return f"{base} · {extra}" if extra else base
+
+
+def insert_depense(
+    conn: sqlite3.Connection,
+    description: str,
+    montant: float,
+    depense_date: date,
+) -> int:
+    conn.execute(
+        "INSERT INTO depenses(description, montant, date) VALUES(?, ?, ?)",
+        (description.strip(), float(montant), to_iso(depense_date)),
+    )
+    dep_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+    log_activity(
+        conn,
+        type_operation="CREATE",
+        entite="depense",
+        entite_id=dep_id,
+        details=f"Ajout depense #{dep_id} " + fmt_depense_compact(description, float(montant), to_iso(depense_date)),
+    )
+    conn.commit()
+    return dep_id
+
+
+def activity_entite_label(entite: str) -> str:
+    labels = {
+        "membre": "Membre",
+        "contribution": "Cotisation",
+        "depense": "Dépense",
+        "reports_membres": "Solde N-1 membre",
+        "reports_association": "Solde association",
+        "import_excel": "Import Excel",
+    }
+    return labels.get(str(entite), str(entite))
+
+
+def _render_member_edit_panel(conn: sqlite3.Connection, selected_id: int) -> None:
+    member_row = conn.execute(
+        """
+        SELECT id, actif, reference, nom, prenom, telephone, village_origine,
+               adresse, prefecture, email, date_inscription
+        FROM membres WHERE id = ?
+        """,
+        (selected_id,),
+    ).fetchone()
+    if not member_row:
+        return
+
+    etat = "Actif" if int(member_row["actif"]) == 1 else "Archivé"
+    with st.container(border=True):
+        st.markdown(f"#### {member_row['reference']} — {member_row['nom']} {member_row['prenom']}")
+        st.caption(f"État : **{etat}**")
+
+        try:
+            current_inscription = datetime.fromisoformat(member_row["date_inscription"]).date()
+        except (TypeError, ValueError):
+            current_inscription = date.today()
+
+        with st.form(f"edit_member_{selected_id}"):
+            e1, e2 = st.columns(2)
+            with e1:
+                edit_nom = st.text_input("Nom *", value=member_row["nom"] or "")
+                edit_prenom = st.text_input("Prénom *", value=member_row["prenom"] or "")
+                edit_telephone = st.text_input("Téléphone", value=member_row["telephone"] or "")
+                edit_village = st.text_input("Village d'origine", value=member_row["village_origine"] or "")
+                edit_prefecture = st.text_input("Préfecture", value=member_row["prefecture"] or "")
+            with e2:
+                edit_email = st.text_input("Email", value=member_row["email"] or "")
+                edit_adresse = st.text_input("Adresse", value=member_row["adresse"] or "")
+                edit_inscription = st.date_input("Date d'inscription", value=current_inscription)
+
+            if st.form_submit_button("Enregistrer les modifications", use_container_width=True):
+                nom_v = edit_nom.strip()
+                prenom_v = edit_prenom.strip()
+                if not nom_v or not prenom_v:
+                    st.error("Nom et prénom sont obligatoires.")
+                elif edit_email.strip() and (
+                    "@" not in edit_email or "." not in edit_email.strip().split("@")[-1]
+                ):
+                    st.error("Email invalide.")
+                else:
+                    before = fmt_member_compact(
+                        reference=member_row["reference"],
+                        nom=member_row["nom"],
+                        prenom=member_row["prenom"],
+                        telephone=member_row["telephone"],
+                        village=member_row["village_origine"],
+                        prefecture=member_row["prefecture"],
+                        email=member_row["email"],
+                        adresse=member_row["adresse"],
+                        date_inscription=member_row["date_inscription"],
                     )
-                    new_id = int(cur.lastrowid)
-                    conn.execute("UPDATE membres SET reference = ? WHERE id = ?", (member_ref(new_id), new_id))
-                    log_activity(
-                        conn,
-                        type_operation="CREATE",
-                        entite="membre",
-                        entite_id=new_id,
-                        details="Ajout membre "
-                        + fmt_member_compact(
-                            reference=member_ref(new_id),
-                            nom=nom,
-                            prenom=prenom,
-                            telephone=telephone,
-                            village=village_origine,
-                            prefecture=prefecture,
-                            email=email,
-                            adresse=adresse,
-                            date_inscription=to_iso(date_inscription),
+                    conn.execute(
+                        """
+                        UPDATE membres
+                        SET nom = ?, prenom = ?, telephone = ?, village_origine = ?,
+                            adresse = ?, prefecture = ?, email = ?, date_inscription = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            nom_v,
+                            prenom_v.strip(),
+                            edit_telephone.strip(),
+                            edit_village.strip(),
+                            edit_adresse.strip(),
+                            edit_prefecture.strip(),
+                            edit_email.strip(),
+                            to_iso(edit_inscription),
+                            selected_id,
                         ),
                     )
+                    after = fmt_member_compact(
+                        reference=member_row["reference"],
+                        nom=nom_v,
+                        prenom=prenom_v,
+                        telephone=edit_telephone.strip(),
+                        village=edit_village.strip(),
+                        prefecture=edit_prefecture.strip(),
+                        email=edit_email.strip(),
+                        adresse=edit_adresse.strip(),
+                        date_inscription=to_iso(edit_inscription),
+                    )
+                    log_activity(
+                        conn,
+                        type_operation="UPDATE",
+                        entite="membre",
+                        entite_id=selected_id,
+                        details=f"Maj membre {before}  ->  {after}",
+                    )
                     conn.commit()
-                    st.success("Membre ajouté.")
-                except sqlite3.IntegrityError:
-                    st.error("Impossible d'ajouter ce membre (integrite des donnees).")
+                    st.success("Fiche membre mise à jour.")
+                    st.rerun()
 
-    st.markdown("### Liste des membres")
-    view_mode = st.radio(
-        "Afficher",
-        ["Actifs", "Archivés", "Tous"],
-        horizontal=True,
-    )
-    where_sql = "WHERE actif = 1"
-    if view_mode == "Archivés":
-        where_sql = "WHERE actif = 0"
-    elif view_mode == "Tous":
-        where_sql = ""
-
-    df = fetch_df(
-        conn,
-        """
-        SELECT
-            id,
-            reference,
-            CASE WHEN actif = 1 THEN 'Actif' ELSE 'Archive' END AS etat,
-            nom, prenom, telephone, village_origine, prefecture, email, adresse, date_inscription
-        FROM membres
-        """
-        + where_sql
-        + """
-        ORDER BY nom, prenom;
-        """,
-    )
-    if not df.empty:
-        df["reference_complete"] = df.apply(
-            lambda r: member_ref_label(
-                str(r["reference"]),
-                str(r["nom"]),
-                str(r["prenom"]),
-                str(r["village_origine"] or ""),
-                str(r["telephone"] or ""),
-            ),
-            axis=1,
-        )
-        search = st.text_input("Recherche (référence, nom, téléphone)", "").strip().lower()
-        if search:
-            filt = (
-                df["reference_complete"].str.lower().str.contains(search, na=False)
-                | df["nom"].str.lower().str.contains(search, na=False)
-                | df["prenom"].str.lower().str.contains(search, na=False)
-                | df["telephone"].str.lower().str.contains(search, na=False)
-            )
-            df = df[filt]
-    st.dataframe(df, use_container_width=True)
-
-    if not df.empty:
-        options = {
-            (
-                f"{r['reference']} | {r['nom']} {r['prenom']} | "
-                f"village:{r['village_origine'] or '-'} | tel:{r['telephone'] or '-'} | etat:{r['etat']}"
-            ): int(r["id"])
-            for _, r in df.iterrows()
-        }
-        selected = st.selectbox("Membre à modifier", list(options.keys()))
-        selected_id = options[selected]
-        member_row = conn.execute(
-            """
-            SELECT id, actif, reference, nom, prenom, telephone, village_origine,
-                   adresse, prefecture, email, date_inscription
-            FROM membres WHERE id = ?
-            """,
-            (selected_id,),
-        ).fetchone()
-
-        if member_row:
-            st.markdown("#### Modifier les informations du membre")
-            try:
-                current_inscription = datetime.fromisoformat(member_row["date_inscription"]).date()
-            except (TypeError, ValueError):
-                current_inscription = date.today()
-
-            with st.form(f"edit_member_{selected_id}"):
-                e1, e2 = st.columns(2)
-                with e1:
-                    edit_nom = st.text_input(
-                        "Nom *",
-                        value=member_row["nom"] or "",
-                        key=f"edit_nom_{selected_id}",
-                    )
-                    edit_prenom = st.text_input(
-                        "Prénom *",
-                        value=member_row["prenom"] or "",
-                        key=f"edit_prenom_{selected_id}",
-                    )
-                    edit_telephone = st.text_input(
-                        "Téléphone",
-                        value=member_row["telephone"] or "",
-                        key=f"edit_tel_{selected_id}",
-                    )
-                    edit_village = st.text_input(
-                        "Village d'origine",
-                        value=member_row["village_origine"] or "",
-                        key=f"edit_village_{selected_id}",
-                    )
-                    edit_prefecture = st.text_input(
-                        "Préfecture",
-                        value=member_row["prefecture"] or "",
-                        key=f"edit_pref_{selected_id}",
-                    )
-                with e2:
-                    edit_email = st.text_input(
-                        "Email",
-                        value=member_row["email"] or "",
-                        key=f"edit_email_{selected_id}",
-                    )
-                    edit_adresse = st.text_input(
-                        "Adresse",
-                        value=member_row["adresse"] or "",
-                        key=f"edit_adresse_{selected_id}",
-                    )
-                    edit_inscription = st.date_input(
-                        "Date d'inscription",
-                        value=current_inscription,
-                        key=f"edit_inscription_{selected_id}",
-                    )
-
-                update_submitted = st.form_submit_button("Mettre à jour le membre")
-                if update_submitted:
-                    nom_v = edit_nom.strip()
-                    prenom_v = edit_prenom.strip()
-                    telephone_v = edit_telephone.strip()
-                    village_v = edit_village.strip()
-                    prefecture_v = edit_prefecture.strip()
-                    email_v = edit_email.strip()
-                    adresse_v = edit_adresse.strip()
-                    if not nom_v or not prenom_v:
-                        st.error("Nom et prénom sont obligatoires.")
-                    elif email_v and ("@" not in email_v or "." not in email_v.split("@")[-1]):
-                        st.error("Email invalide.")
-                    else:
-                        before = fmt_member_compact(
-                            reference=member_row["reference"],
-                            nom=member_row["nom"],
-                            prenom=member_row["prenom"],
-                            telephone=member_row["telephone"],
-                            village=member_row["village_origine"],
-                            prefecture=member_row["prefecture"],
-                            email=member_row["email"],
-                            adresse=member_row["adresse"],
-                            date_inscription=member_row["date_inscription"],
-                        )
-                        conn.execute(
-                            """
-                            UPDATE membres
-                            SET nom = ?, prenom = ?, telephone = ?, village_origine = ?,
-                                adresse = ?, prefecture = ?, email = ?, date_inscription = ?
-                            WHERE id = ?
-                            """,
-                            (
-                                nom_v,
-                                prenom_v,
-                                telephone_v,
-                                village_v,
-                                adresse_v,
-                                prefecture_v,
-                                email_v,
-                                to_iso(edit_inscription),
-                                selected_id,
-                            ),
-                        )
-                        after = fmt_member_compact(
-                            reference=member_row["reference"],
-                            nom=nom_v,
-                            prenom=prenom_v,
-                            telephone=telephone_v,
-                            village=village_v,
-                            prefecture=prefecture_v,
-                            email=email_v,
-                            adresse=adresse_v,
-                            date_inscription=to_iso(edit_inscription),
-                        )
-                        log_activity(
-                            conn,
-                            type_operation="UPDATE",
-                            entite="membre",
-                            entite_id=selected_id,
-                            details=f"Maj membre {before}  ->  {after}",
-                        )
-                        conn.commit()
-                        st.success("Informations du membre mises à jour.")
-                        st.rerun()
-
-            st.markdown("#### Solde reporté N-1")
+        with st.expander("Solde N-1 (retard reporté)", expanded=False):
             report_year = st.number_input(
-                "Exercice concerné",
+                "Exercice",
                 min_value=2020,
                 max_value=2100,
                 value=date.today().year,
                 step=1,
                 key=f"member_report_year_{selected_id}",
-                help="Montant dû repris de l'année précédente pour cet exercice (comme la colonne Solde N-1 du classeur Excel).",
             )
             current_solde = get_member_report(conn, selected_id, int(report_year))
             new_solde = st.number_input(
-                f"Solde N-1 (EUR, exercice {int(report_year)})",
+                f"Montant (EUR)",
                 min_value=0.0,
                 value=float(current_solde),
                 step=1.0,
@@ -746,417 +768,622 @@ def page_membres(conn: sqlite3.Connection) -> None:
             )
             if st.button("Enregistrer le solde N-1", key=f"save_solde_n1_{selected_id}"):
                 upsert_member_report(conn, selected_id, int(report_year), float(new_solde))
-                st.success(f"Solde N-1 enregistré pour l'exercice {int(report_year)}.")
+                st.toast("Solde N-1 enregistré.")
                 st.rerun()
 
-        if member_row and int(member_row["actif"]) == 1:
-            if st.button("Archiver le membre", type="secondary"):
-                conn.execute("UPDATE membres SET actif = 0 WHERE id = ?", (selected_id,))
-                log_activity(
-                    conn,
-                    type_operation="UPDATE",
-                    entite="membre",
-                    entite_id=selected_id,
-                    details=f"Archivage membre {member_row['reference']} {member_row['nom']} {member_row['prenom']}",
-                )
-                conn.commit()
-                st.success("Membre archivé.")
-        if member_row and int(member_row["actif"]) == 0:
-            if st.button("Réactiver le membre"):
-                conn.execute("UPDATE membres SET actif = 1 WHERE id = ?", (selected_id,))
-                log_activity(
-                    conn,
-                    type_operation="UPDATE",
-                    entite="membre",
-                    entite_id=selected_id,
-                    details=f"Reactivation membre {member_row['reference']} {member_row['nom']} {member_row['prenom']}",
-                )
-                conn.commit()
-                st.success("Membre réactivé.")
+        a1, a2 = st.columns(2)
+        with a1:
+            if int(member_row["actif"]) == 1:
+                if st.button("Archiver ce membre", type="secondary", use_container_width=True):
+                    conn.execute("UPDATE membres SET actif = 0 WHERE id = ?", (selected_id,))
+                    log_activity(
+                        conn,
+                        type_operation="UPDATE",
+                        entite="membre",
+                        entite_id=selected_id,
+                        details=f"Archivage membre {member_row['reference']} {member_row['nom']} {member_row['prenom']}",
+                    )
+                    conn.commit()
+                    st.rerun()
+        with a2:
+            if int(member_row["actif"]) == 0:
+                if st.button("Réactiver ce membre", use_container_width=True):
+                    conn.execute("UPDATE membres SET actif = 1 WHERE id = ?", (selected_id,))
+                    log_activity(
+                        conn,
+                        type_operation="UPDATE",
+                        entite="membre",
+                        entite_id=selected_id,
+                        details=f"Reactivation membre {member_row['reference']} {member_row['nom']} {member_row['prenom']}",
+                    )
+                    conn.commit()
+                    st.rerun()
 
-    st.markdown("### Initialisation — Soldes N-1 par membre")
-    st.caption(
-        "Reprise du retard fin d'année précédente (colonne « Solde N-1 » du fichier Excel). "
-        "Ce montant s'ajoute aux cotisations attendues pour le calcul du statut."
+
+def page_membres(conn: sqlite3.Connection) -> None:
+    st.subheader("Membres")
+    render_page_guide(
+        "1️⃣ Cliquez sur un membre dans le tableau &nbsp;→&nbsp; 2️⃣ Modifiez sa fiche à droite. "
+        "Onglet <strong>Soldes N-1</strong> pour l'initialisation en masse."
     )
-    init_year = st.number_input(
+
+    counts = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN actif = 1 THEN 1 ELSE 0 END) AS actifs,
+            SUM(CASE WHEN actif = 0 THEN 1 ELSE 0 END) AS archives
+        FROM membres;
+        """
+    ).fetchone()
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Membres actifs", int(counts["actifs"] or 0))
+    k2.metric("Archivés", int(counts["archives"] or 0))
+    k3.metric("Total", int((counts["actifs"] or 0) + (counts["archives"] or 0)))
+
+    tab_liste, tab_ajouter, tab_soldes = st.tabs(["📋 Liste", "➕ Nouveau", "💰 Soldes N-1"])
+
+    with tab_ajouter:
+        with st.container(border=True):
+            st.markdown("##### Ajouter un membre")
+            with st.form("add_member", clear_on_submit=True):
+                c1, c2 = st.columns(2)
+                with c1:
+                    nom = st.text_input("Nom *")
+                    prenom = st.text_input("Prénom *")
+                    telephone = st.text_input("Téléphone")
+                    village_origine = st.text_input("Village d'origine")
+                    prefecture = st.text_input("Préfecture")
+                with c2:
+                    email = st.text_input("Email")
+                    adresse = st.text_input("Adresse")
+                    date_inscription = st.date_input("Date d'inscription", value=date.today())
+                if st.form_submit_button("Ajouter le membre", type="primary", use_container_width=True):
+                    nom_v, prenom_v = nom.strip(), prenom.strip()
+                    email_v = email.strip()
+                    if not nom_v or not prenom_v:
+                        st.error("Nom et prénom sont obligatoires.")
+                    elif email_v and ("@" not in email_v or "." not in email_v.split("@")[-1]):
+                        st.error("Email invalide.")
+                    else:
+                        try:
+                            cur = conn.execute(
+                                """
+                                INSERT INTO membres(reference, nom, prenom, telephone, village_origine,
+                                    adresse, prefecture, email, date_inscription, actif)
+                                VALUES('', ?, ?, ?, ?, ?, ?, ?, ?, 1);
+                                """,
+                                (
+                                    nom_v,
+                                    prenom_v,
+                                    telephone.strip(),
+                                    village_origine.strip(),
+                                    adresse.strip(),
+                                    prefecture.strip(),
+                                    email_v,
+                                    to_iso(date_inscription),
+                                ),
+                            )
+                            new_id = int(cur.lastrowid)
+                            conn.execute(
+                                "UPDATE membres SET reference = ? WHERE id = ?",
+                                (member_ref(new_id), new_id),
+                            )
+                            log_activity(
+                                conn,
+                                type_operation="CREATE",
+                                entite="membre",
+                                entite_id=new_id,
+                                details="Ajout membre "
+                                + fmt_member_compact(
+                                    reference=member_ref(new_id),
+                                    nom=nom_v,
+                                    prenom=prenom_v,
+                                    telephone=telephone.strip(),
+                                    village=village_origine.strip(),
+                                    prefecture=prefecture.strip(),
+                                    email=email_v,
+                                    adresse=adresse.strip(),
+                                    date_inscription=to_iso(date_inscription),
+                                ),
+                            )
+                            conn.commit()
+                            st.session_state["membre_selected_id"] = new_id
+                            st.success(f"Membre {member_ref(new_id)} ajouté.")
+                            st.rerun()
+                        except sqlite3.IntegrityError:
+                            st.error("Impossible d'ajouter ce membre.")
+
+    with tab_soldes:
+        st.caption(
+            "Montant dû repris de l'année précédente (colonne « Solde N-1 » Excel). "
+            "Utilisé pour le statut des cotisations."
+        )
+        init_year = st.number_input(
+            "Exercice",
+            min_value=2020,
+            max_value=2100,
+            value=date.today().year,
+            step=1,
+            key="bulk_solde_n1_year",
+        )
+        init_members = fetch_df(
+            conn,
+            """
+            SELECT id, reference, nom, prenom
+            FROM membres WHERE actif = 1 ORDER BY nom, prenom;
+            """,
+        )
+        if init_members.empty:
+            st.info("Aucun membre actif.")
+        else:
+            init_rows = [
+                {
+                    "id": int(r["id"]),
+                    "reference": r["reference"],
+                    "nom": r["nom"],
+                    "prenom": r["prenom"],
+                    "solde_n1": get_member_report(conn, int(r["id"]), int(init_year)),
+                }
+                for _, r in init_members.iterrows()
+            ]
+            edited_init = st.data_editor(
+                pd.DataFrame(init_rows),
+                column_config={
+                    "id": st.column_config.NumberColumn("Id", disabled=True),
+                    "reference": st.column_config.TextColumn("Référence", disabled=True),
+                    "nom": st.column_config.TextColumn("Nom", disabled=True),
+                    "prenom": st.column_config.TextColumn("Prénom", disabled=True),
+                    "solde_n1": st.column_config.NumberColumn(
+                        f"Solde N-1 ({int(init_year)})",
+                        min_value=0.0,
+                        step=1.0,
+                        format="%.2f",
+                    ),
+                },
+                hide_index=True,
+                num_rows="fixed",
+                use_container_width=True,
+                key=f"bulk_solde_editor_{int(init_year)}",
+            )
+            if st.button("Enregistrer tous les soldes N-1", type="primary", key="bulk_save_solde_n1"):
+                for _, row in edited_init.iterrows():
+                    upsert_member_report(conn, int(row["id"]), int(init_year), float(row["solde_n1"]))
+                st.success(f"{len(edited_init)} solde(s) enregistré(s).")
+                st.rerun()
+
+    with tab_liste:
+        view_mode = st.radio(
+            "Afficher",
+            ["Actifs", "Archivés", "Tous"],
+            horizontal=True,
+            index=0,
+            key="membres_view_mode",
+        )
+        where_sql = "WHERE actif = 1"
+        if view_mode == "Archivés":
+            where_sql = "WHERE actif = 0"
+        elif view_mode == "Tous":
+            where_sql = ""
+
+        df = fetch_df(
+            conn,
+            """
+            SELECT id, reference,
+                   CASE WHEN actif = 1 THEN '✅ Actif' ELSE '📦 Archivé' END AS etat,
+                   nom, prenom, telephone, village_origine, prefecture, email, date_inscription
+            FROM membres
+            """
+            + where_sql
+            + " ORDER BY nom, prenom;",
+        )
+        if df.empty:
+            st.info("Aucun membre dans cette catégorie.")
+            return
+
+        search = st.text_input(
+            "Rechercher",
+            "",
+            key="membres_search",
+            placeholder="Nom, référence, téléphone, village…",
+        )
+        df = filter_df_search(
+            df,
+            search,
+            ["reference", "nom", "prenom", "telephone", "village_origine", "prefecture"],
+        )
+        st.caption(f"{len(df)} membre(s) — cliquez sur une ligne pour ouvrir la fiche.")
+
+        grid_view = df.drop(columns=["id"], errors="ignore")
+        id_by_row = df["id"].astype(int).tolist()
+
+        selection = st.dataframe(
+            grid_view,
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="membres_grid",
+            column_config={
+                "reference": st.column_config.TextColumn("Réf.", width="small"),
+                "etat": st.column_config.TextColumn("État", width="small"),
+            },
+        )
+
+        selected_rows = []
+        if selection is not None and hasattr(selection, "selection") and selection.selection is not None:
+            selected_rows = list(selection.selection.rows or [])
+
+        if selected_rows and 0 <= selected_rows[0] < len(id_by_row):
+            st.session_state["membre_selected_id"] = id_by_row[selected_rows[0]]
+
+        valid_ids = set(id_by_row)
+        if "membre_selected_id" not in st.session_state or st.session_state["membre_selected_id"] not in valid_ids:
+            st.session_state["membre_selected_id"] = id_by_row[0]
+
+        pick_options = {
+            member_row_label(
+                str(r["reference"]),
+                str(r["nom"]),
+                str(r["prenom"]),
+                str(r["village_origine"] or r["telephone"] or ""),
+            ): int(r["id"])
+            for _, r in df.iterrows()
+        }
+        pick_labels = list(pick_options.keys())
+        current_id = int(st.session_state["membre_selected_id"])
+        pick_idx = next((i for i, lbl in enumerate(pick_labels) if pick_options[lbl] == current_id), 0)
+        picked = st.selectbox("Membre sélectionné", pick_labels, index=pick_idx)
+        st.session_state["membre_selected_id"] = pick_options[picked]
+
+        st.divider()
+        _render_member_edit_panel(conn, int(st.session_state["membre_selected_id"]))
+
+
+def page_contributions(conn: sqlite3.Connection) -> None:
+    st.subheader("Cotisations")
+    render_page_guide("1️⃣ Choisissez un membre dans le tableau → 2️⃣ Enregistrez sa cotisation à droite.")
+
+    members = fetch_df(
+        conn,
+        "SELECT id FROM membres WHERE actif = 1",
+    )
+    if members.empty:
+        st.info("Commencez par ajouter au moins un membre (menu **Membres**).")
+        return
+
+    year = st.number_input(
         "Exercice",
         min_value=2020,
         max_value=2100,
         value=date.today().year,
         step=1,
-        key="bulk_solde_n1_year",
+        key="contrib_year",
+        help="Année prise en compte pour le statut et l'historique.",
     )
-    init_members = fetch_df(
-        conn,
-        """
-        SELECT id, reference, nom, prenom
-        FROM membres
-        WHERE actif = 1
-        ORDER BY nom, prenom;
-        """,
-    )
-    if init_members.empty:
+    year_int = int(year)
+
+    status_all = get_members_status(conn, year_int)
+    if status_all.empty:
         st.info("Aucun membre actif.")
-    else:
-        init_rows = []
-        for _, r in init_members.iterrows():
-            mid = int(r["id"])
-            init_rows.append(
-                {
-                    "id": mid,
-                    "reference": r["reference"],
-                    "nom": r["nom"],
-                    "prenom": r["prenom"],
-                    "solde_n1": get_member_report(conn, mid, int(init_year)),
-                }
-            )
-        init_df = pd.DataFrame(init_rows)
-        edited_init = st.data_editor(
-            init_df,
-            column_config={
-                "id": st.column_config.NumberColumn("Id", disabled=True),
-                "reference": st.column_config.TextColumn("Référence", disabled=True),
-                "nom": st.column_config.TextColumn("Nom", disabled=True),
-                "prenom": st.column_config.TextColumn("Prénom", disabled=True),
-                "solde_n1": st.column_config.NumberColumn(
-                    f"Solde N-1 ({int(init_year)})",
-                    min_value=0.0,
-                    step=1.0,
-                    format="%.2f",
-                ),
-            },
-            hide_index=True,
-            num_rows="fixed",
-            use_container_width=True,
-            key=f"bulk_solde_editor_{int(init_year)}",
-        )
-        if st.button("Enregistrer tous les soldes N-1", type="primary", key="bulk_save_solde_n1"):
-            n_saved = 0
-            for _, row in edited_init.iterrows():
-                upsert_member_report(conn, int(row["id"]), int(init_year), float(row["solde_n1"]))
-                n_saved += 1
-            st.success(f"{n_saved} solde(s) N-1 enregistré(s) pour l'exercice {int(init_year)}.")
-            st.rerun()
-
-
-def page_contributions(conn: sqlite3.Connection) -> None:
-    st.subheader("Contributions")
-    members = fetch_df(
-        conn,
-        "SELECT id, reference, nom, prenom, village_origine, telephone FROM membres WHERE actif = 1 ORDER BY nom, prenom",
-    )
-    if members.empty:
-        st.info("Ajoute d'abord au moins un membre.")
         return
 
-    member_options = {
-        (
-            f"{r['reference']} | {r['nom']} {r['prenom']} | "
-            f"{r['village_origine'] or '-'} | {r['telephone'] or '-'} ({r['id']})"
-        ): int(r["id"])
-        for _, r in members.iterrows()
-    }
+    nb_late = int((status_all["statut"] == "En retard").sum())
+    nb_ok = int(len(status_all) - nb_late)
+    total_year = total_contributions(conn, year_int)
 
-    with st.form("add_contribution", clear_on_submit=True):
-        member_label = st.selectbox("Membre", list(member_options.keys()))
-        montant = st.number_input("Montant", min_value=0.01, value=MONTHLY_CONTRIBUTION, step=1.0)
-        contribution_date = st.date_input("Date", value=date.today())
-        note = st.text_input("Note (optionnel)")
-        submitted = st.form_submit_button("Enregistrer")
-        if submitted:
-            cur = conn.execute(
-                "INSERT INTO contributions(membre_id, montant, date, note) VALUES(?, ?, ?, ?)",
-                (member_options[member_label], float(montant), to_iso(contribution_date), note.strip()),
-            )
-            log_activity(
-                conn,
-                type_operation="CREATE",
-                entite="contribution",
-                entite_id=cur.lastrowid,
-                details=(
-                    f"Ajout cotisation #{cur.lastrowid} {member_ref(member_options[member_label])} "
-                    + fmt_contribution_compact(float(montant), to_iso(contribution_date), note)
-                ),
-            )
-            conn.commit()
-            st.success("Contribution enregistrée.")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Membres actifs", len(status_all))
+    k2.metric("À jour", nb_ok)
+    k3.metric("En retard", nb_late)
+    k4.metric("Encaissé (année)", format_eur(total_year))
 
-    st.markdown("### Historique")
+    f1, f2 = st.columns([3, 1])
+    with f1:
+        search = st.text_input(
+            "Rechercher un membre",
+            "",
+            key="contrib_search",
+            placeholder="Nom, référence M005, téléphone, village…",
+        )
+    with f2:
+        only_late = st.toggle("Uniquement en retard", value=False, key="contrib_only_late")
 
-    all_members = fetch_df(
-        conn,
-        """
-        SELECT id, reference, nom, prenom, telephone, village_origine
-        FROM membres
-        ORDER BY nom, prenom;
-        """,
+    filtered = sort_status_for_entry(filter_members_status(status_all, search, only_late))
+    if filtered.empty:
+        st.warning("Aucun membre ne correspond à votre recherche.")
+        return
+
+    st.caption(f"{len(filtered)} membre(s) affiché(s) — cliquez sur une ligne pour la sélectionner.")
+
+    grid_df = status_grid_dataframe(filtered)
+    id_by_row = filtered["id"].astype(int).tolist()
+
+    selection = st.dataframe(
+        grid_df,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="contrib_member_grid",
+        column_config={
+            "Référence": st.column_config.TextColumn(width="small"),
+            "Statut": st.column_config.TextColumn(width="small"),
+            "Reste": st.column_config.NumberColumn(format="%.2f EUR"),
+            "Payé": st.column_config.NumberColumn(format="%.2f EUR"),
+            "Attendu": st.column_config.NumberColumn(format="%.2f EUR"),
+            "Solde N-1": st.column_config.NumberColumn(format="%.2f EUR"),
+        },
     )
-    ALL_MEMBERS_LABEL = "Tous les membres"
-    hist_member_options: dict[str, Optional[int]] = {ALL_MEMBERS_LABEL: None}
-    for _, r in all_members.iterrows():
-        label = (
-            f"{r['reference']} | {r['nom']} {r['prenom']} | "
-            f"{r['village_origine'] or '-'} | {r['telephone'] or '-'}"
-        )
-        hist_member_options[label] = int(r["id"])
 
-    hist_col_year, hist_col_member, hist_col_search = st.columns([1, 2, 2])
-    with hist_col_year:
-        year = st.number_input(
-            "Année", min_value=2020, max_value=2100, value=date.today().year, step=1
-        )
-    with hist_col_member:
-        hist_member_label = st.selectbox(
-            "Membre",
-            list(hist_member_options.keys()),
-            index=0,
-            key="hist_member",
-        )
-    selected_member_id = hist_member_options[hist_member_label]
-    with hist_col_search:
-        hist_search = (
-            st.text_input(
-                "Rechercher (référence, nom, prénom, note)",
-                "",
-                key="hist_search",
-                placeholder="ex: M002, Doe, virement…",
+    selected_rows = []
+    if selection is not None and hasattr(selection, "selection") and selection.selection is not None:
+        selected_rows = list(selection.selection.rows or [])
+
+    if selected_rows and 0 <= selected_rows[0] < len(id_by_row):
+        st.session_state["contrib_member_id"] = id_by_row[selected_rows[0]]
+
+    if "contrib_member_id" not in st.session_state or st.session_state["contrib_member_id"] not in id_by_row:
+        st.session_state["contrib_member_id"] = id_by_row[0]
+
+    current_id = int(st.session_state["contrib_member_id"])
+    pick_options = {member_pick_label(r): int(r["id"]) for _, r in filtered.iterrows()}
+    pick_labels = list(pick_options.keys())
+    default_pick_idx = next(
+        (i for i, lbl in enumerate(pick_labels) if pick_options[lbl] == current_id),
+        0,
+    )
+    picked = st.selectbox(
+        "Membre sélectionné",
+        pick_labels,
+        index=default_pick_idx,
+        help="Alternative au clic dans le tableau — pratique sur téléphone.",
+    )
+    st.session_state["contrib_member_id"] = pick_options[picked]
+    selected_member_id = int(st.session_state["contrib_member_id"])
+
+    member_row = filtered.loc[filtered["id"] == selected_member_id].iloc[0]
+    reste = float(member_row["reste"])
+    attendu = float(member_row["attendu"])
+    paye = float(member_row["total_paye"])
+    solde_n1 = float(member_row["solde_n1"])
+    statut_txt = str(member_row["statut"])
+    statut_badge = "✅ À jour" if statut_txt == "A jour" else "⏳ En retard"
+
+    st.divider()
+
+    col_table, col_form = st.columns([1.45, 1], gap="large")
+
+    with col_form:
+        with st.container(border=True):
+            st.markdown(f"#### {member_row['reference']} — {member_row['nom']} {member_row['prenom']}")
+            st.caption(
+                f"{statut_badge} · Village : {member_row['village_origine'] or '—'} · "
+                f"Solde N-1 : {format_eur(solde_n1)}"
             )
-            .strip()
-            .lower()
-        )
 
-    if selected_member_id is None:
+            m_a, m_b, m_c = st.columns(3)
+            m_a.metric("Payé", format_eur(paye))
+            m_b.metric("Attendu", format_eur(attendu))
+            m_c.metric("Reste", format_eur(reste))
+
+            st.markdown("##### Enregistrement rapide")
+            quick_col1, quick_col2 = st.columns(2)
+            with quick_col1:
+                if st.button(
+                    f"+ {MONTHLY_CONTRIBUTION:.0f} EUR (aujourd'hui)",
+                    type="primary",
+                    use_container_width=True,
+                    key="contrib_quick_month",
+                ):
+                    insert_contribution(
+                        conn,
+                        selected_member_id,
+                        MONTHLY_CONTRIBUTION,
+                        date.today(),
+                        "Cotisation mensuelle",
+                    )
+                    st.toast(f"Cotisation enregistrée pour {member_row['reference']}.")
+                    st.rerun()
+            with quick_col2:
+                if reste > 0.001 and st.button(
+                    f"Régler le reste ({format_eur(reste)})",
+                    use_container_width=True,
+                    key="contrib_quick_reste",
+                ):
+                    insert_contribution(
+                        conn,
+                        selected_member_id,
+                        reste,
+                        date.today(),
+                        "Règlement du solde",
+                    )
+                    st.toast(f"Solde réglé pour {member_row['reference']}.")
+                    st.rerun()
+
+            with st.expander("Autre montant ou date", expanded=False):
+                with st.form("add_contribution_custom", clear_on_submit=True):
+                    montant = st.number_input(
+                        "Montant (EUR)",
+                        min_value=0.01,
+                        value=MONTHLY_CONTRIBUTION,
+                        step=1.0,
+                    )
+                    contribution_date = st.date_input("Date", value=date.today())
+                    note = st.text_input("Note (facultatif)", placeholder="Ex. virement, espèces…")
+                    if st.form_submit_button("Enregistrer", use_container_width=True):
+                        insert_contribution(
+                            conn,
+                            selected_member_id,
+                            float(montant),
+                            contribution_date,
+                            note,
+                        )
+                        st.success("Cotisation enregistrée.")
+                        st.rerun()
+
+    with col_table:
+        st.markdown("##### Historique du membre")
         hist = fetch_df(
             conn,
             """
-            SELECT c.id, c.date, m.reference, m.nom, m.prenom, c.montant, c.note
+            SELECT c.id, c.date, c.montant, c.note
             FROM contributions c
-            JOIN membres m ON m.id = c.membre_id
-            WHERE strftime('%Y', c.date) = ?
-            ORDER BY c.date DESC, c.id DESC;
-            """,
-            (str(year),),
-        )
-    else:
-        hist = fetch_df(
-            conn,
-            """
-            SELECT c.id, c.date, m.reference, m.nom, m.prenom, c.montant, c.note
-            FROM contributions c
-            JOIN membres m ON m.id = c.membre_id
             WHERE strftime('%Y', c.date) = ?
               AND c.membre_id = ?
             ORDER BY c.date DESC, c.id DESC;
             """,
-            (str(year), selected_member_id),
+            (str(year_int), selected_member_id),
         )
-
-    if hist_search and not hist.empty:
-        mask = (
-            hist["reference"].astype(str).str.lower().str.contains(hist_search, na=False)
-            | hist["nom"].astype(str).str.lower().str.contains(hist_search, na=False)
-            | hist["prenom"].astype(str).str.lower().str.contains(hist_search, na=False)
-            | hist["note"].astype(str).str.lower().str.contains(hist_search, na=False)
-        )
-        hist = hist[mask]
-
-    if selected_member_id is None:
-        if hist_search:
-            st.caption(f"{len(hist)} ligne(s) correspondante(s).")
-        st.dataframe(hist, use_container_width=True, hide_index=True)
-        st.metric("Total contributions (année)", f"{total_contributions(conn, int(year)):.2f} EUR")
-    else:
-        member_info = next(
-            (
-                lbl
-                for lbl, mid in hist_member_options.items()
-                if mid == selected_member_id
-            ),
-            "",
-        )
-        st.markdown(f"**{member_info} — Exercice {int(year)}**")
-
-        total_paid = float(hist["montant"].sum()) if not hist.empty else 0.0
-        nb_contrib = int(len(hist))
-        last_date = hist["date"].max() if not hist.empty else "—"
-
-        m1, m2, m3 = st.columns(3)
-        member_status = get_members_status(conn, int(year)).query("id == @selected_member_id")
-        solde_n1 = float(member_status["solde_n1"].iloc[0]) if not member_status.empty else 0.0
-        attendu = float(member_status["attendu"].iloc[0]) if not member_status.empty else 0.0
-        reste = float(member_status["reste"].iloc[0]) if not member_status.empty else 0.0
-        statut = str(member_status["statut"].iloc[0]) if not member_status.empty else "—"
-
-        m1.metric("Total payé", f"{total_paid:,.2f} EUR".replace(",", " "))
-        m2.metric("Solde N-1", f"{solde_n1:,.2f} EUR".replace(",", " "))
-        m3.metric("Attendu / Reste", f"{attendu:,.2f} / {reste:,.2f} EUR".replace(",", " "))
-        st.caption(f"Statut : **{statut}** — dernière cotisation : {last_date if last_date else '—'} ({nb_contrib} ligne(s))")
-
-        if hist_search:
-            st.caption(f"{len(hist)} ligne(s) correspondante(s).")
         if hist.empty:
-            st.info("Aucune cotisation pour ce membre sur l'année sélectionnée.")
+            st.info("Aucune cotisation enregistrée pour cet exercice.")
         else:
             st.dataframe(
-                hist[["id", "date", "montant", "note"]],
+                hist,
                 use_container_width=True,
                 hide_index=True,
+                column_config={
+                    "date": st.column_config.TextColumn("Date"),
+                    "montant": st.column_config.NumberColumn("Montant", format="%.2f EUR"),
+                    "note": st.column_config.TextColumn("Note"),
+                },
             )
 
-    if not hist.empty:
-        with st.expander("Corriger une contribution", expanded=False):
-            st.caption("Sélectionnez la ligne à modifier ou supprimer en cas d'erreur de saisie.")
-            row_options = {
-                f"id={int(r['id'])} | {r['date']} | {r['nom']} {r['prenom']} | {float(r['montant']):.2f} EUR": int(r["id"])
-                for _, r in hist.iterrows()
-            }
-            selected_label = st.selectbox("Contribution à corriger", list(row_options.keys()))
-            selected_id = row_options[selected_label]
-            row = conn.execute(
-                "SELECT id, membre_id, montant, date, note FROM contributions WHERE id = ?",
-                (selected_id,),
-            ).fetchone()
-            if row:
-                reverse_members = {v: k for k, v in member_options.items()}
-                default_member_label = reverse_members.get(int(row["membre_id"]), list(member_options.keys())[0])
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    edit_member = st.selectbox(
-                        "Membre (édition)",
-                        list(member_options.keys()),
-                        index=list(member_options.keys()).index(default_member_label),
-                        key=f"edit_member_{selected_id}",
-                    )
-                with c2:
-                    edit_amount = st.number_input(
-                        "Montant (édition)",
-                        min_value=0.01,
-                        value=float(row["montant"]),
-                        step=1.0,
-                        key=f"edit_amount_{selected_id}",
-                    )
-                with c3:
-                    edit_date = st.date_input(
-                        "Date (édition)",
-                        value=datetime.fromisoformat(row["date"]).date(),
-                        key=f"edit_date_{selected_id}",
-                    )
-                with c4:
-                    edit_note = st.text_input(
-                        "Note (édition)",
-                        value=row["note"] or "",
-                        key=f"edit_note_{selected_id}",
-                    )
+            with st.expander("Corriger ou supprimer une ligne", expanded=False):
+                row_options = {
+                    f"{r['date']} · {float(r['montant']):.2f} EUR · {(r['note'] or '—')}": int(r["id"])
+                    for _, r in hist.iterrows()
+                }
+                selected_label = st.selectbox(
+                    "Ligne à corriger",
+                    list(row_options.keys()),
+                    key="contrib_edit_pick",
+                )
+                selected_id = row_options[selected_label]
+                row = conn.execute(
+                    "SELECT id, membre_id, montant, date, note FROM contributions WHERE id = ?",
+                    (selected_id,),
+                ).fetchone()
+                if row:
+                    e1, e2 = st.columns(2)
+                    with e1:
+                        edit_amount = st.number_input(
+                            "Montant",
+                            min_value=0.01,
+                            value=float(row["montant"]),
+                            step=1.0,
+                            key=f"edit_amount_{selected_id}",
+                        )
+                        edit_date = st.date_input(
+                            "Date",
+                            value=datetime.fromisoformat(row["date"]).date(),
+                            key=f"edit_date_{selected_id}",
+                        )
+                    with e2:
+                        edit_note = st.text_input(
+                            "Note",
+                            value=row["note"] or "",
+                            key=f"edit_note_{selected_id}",
+                        )
+                    b1, b2 = st.columns(2)
+                    with b1:
+                        if st.button("Mettre à jour", key=f"update_contrib_{selected_id}"):
+                            before = fmt_contribution_compact(
+                                float(row["montant"]), str(row["date"]), row["note"] or ""
+                            )
+                            conn.execute(
+                                """
+                                UPDATE contributions
+                                SET montant = ?, date = ?, note = ?
+                                WHERE id = ?
+                                """,
+                                (float(edit_amount), to_iso(edit_date), edit_note.strip(), selected_id),
+                            )
+                            after = fmt_contribution_compact(
+                                float(edit_amount), to_iso(edit_date), edit_note.strip()
+                            )
+                            log_activity(
+                                conn,
+                                type_operation="UPDATE",
+                                entite="contribution",
+                                entite_id=selected_id,
+                                details=f"Maj cotisation #{selected_id} {before}  ->  {after}",
+                            )
+                            conn.commit()
+                            st.success("Cotisation mise à jour.")
+                            st.rerun()
+                    with b2:
+                        if st.button("Supprimer", type="secondary", key=f"delete_contrib_{selected_id}"):
+                            conn.execute("DELETE FROM contributions WHERE id = ?", (selected_id,))
+                            log_activity(
+                                conn,
+                                type_operation="DELETE",
+                                entite="contribution",
+                                entite_id=selected_id,
+                                details=f"Suppression cotisation #{selected_id}",
+                            )
+                            conn.commit()
+                            st.success("Cotisation supprimée.")
+                            st.rerun()
 
-                b1, b2 = st.columns(2)
-                with b1:
-                    if st.button("Mettre à jour la contribution", key=f"update_contrib_{selected_id}"):
-                        before = (
-                            f"{member_ref(int(row['membre_id']))} "
-                            + fmt_contribution_compact(float(row["montant"]), str(row["date"]), row["note"] or "")
-                        )
-                        conn.execute(
-                            """
-                            UPDATE contributions
-                            SET membre_id = ?, montant = ?, date = ?, note = ?
-                            WHERE id = ?
-                            """,
-                            (
-                                member_options[edit_member],
-                                float(edit_amount),
-                                to_iso(edit_date),
-                                edit_note.strip(),
-                                selected_id,
-                            ),
-                        )
-                        after = (
-                            f"{member_ref(int(member_options[edit_member]))} "
-                            + fmt_contribution_compact(float(edit_amount), to_iso(edit_date), edit_note.strip())
-                        )
-                        log_activity(
-                            conn,
-                            type_operation="UPDATE",
-                            entite="contribution",
-                            entite_id=selected_id,
-                            details=f"Maj cotisation #{selected_id} {before}  ->  {after}",
-                        )
-                        conn.commit()
-                        st.success("Contribution mise à jour.")
-                with b2:
-                    if st.button("Supprimer la contribution", type="secondary", key=f"delete_contrib_{selected_id}"):
-                        conn.execute("DELETE FROM contributions WHERE id = ?", (selected_id,))
-                        log_activity(
-                            conn,
-                            type_operation="DELETE",
-                            entite="contribution",
-                            entite_id=selected_id,
-                            details=f"Suppression cotisation #{selected_id}",
-                        )
-                        conn.commit()
-                        st.success("Contribution supprimée.")
-
-    st.markdown("### Statut des membres")
-    st.caption(
-        f"Attendu = cotisations mensuelles ({MONTHLY_CONTRIBUTION:.0f} EUR/mois selon date d'inscription) "
-        f"+ solde N-1 reporté pour l'exercice {int(year)}."
-    )
-    status = get_members_status(conn, int(year))
-    if status.empty:
-        st.info("Aucun membre actif.")
-    else:
-        status_search = (
-            st.text_input(
-                "Rechercher un membre (référence, nom, prénom, téléphone)",
-                "",
-                key="status_search",
-                placeholder="ex: M005, Diallo, 0612…",
-            )
-            .strip()
-            .lower()
+    with st.expander("Voir toutes les cotisations de l'exercice", expanded=False):
+        all_hist = fetch_df(
+            conn,
+            """
+            SELECT c.date, m.reference, m.nom, m.prenom, c.montant, c.note
+            FROM contributions c
+            JOIN membres m ON m.id = c.membre_id
+            WHERE strftime('%Y', c.date) = ?
+            ORDER BY c.date DESC, c.id DESC;
+            """,
+            (str(year_int),),
         )
-        if status_search:
+        hist_search = st.text_input(
+            "Filtrer l'historique global",
+            "",
+            key="contrib_hist_global_search",
+            placeholder="Nom, référence, note…",
+        ).strip().lower()
+        if hist_search and not all_hist.empty:
             mask = (
-                status["reference"].astype(str).str.lower().str.contains(status_search, na=False)
-                | status["nom"].astype(str).str.lower().str.contains(status_search, na=False)
-                | status["prenom"].astype(str).str.lower().str.contains(status_search, na=False)
-                | status["telephone"].astype(str).str.lower().str.contains(status_search, na=False)
+                all_hist["reference"].astype(str).str.lower().str.contains(hist_search, na=False)
+                | all_hist["nom"].astype(str).str.lower().str.contains(hist_search, na=False)
+                | all_hist["prenom"].astype(str).str.lower().str.contains(hist_search, na=False)
+                | all_hist["note"].astype(str).str.lower().str.contains(hist_search, na=False)
             )
-            status = status[mask]
-            st.caption(f"{len(status)} membre(s) correspondant(s).")
-        st.dataframe(status_display_df(status), use_container_width=True, hide_index=True)
+            all_hist = all_hist[mask]
+        st.dataframe(all_hist, use_container_width=True, hide_index=True)
+        st.caption(
+            f"Attendu par membre = {MONTHLY_CONTRIBUTION:.0f} EUR/mois (selon inscription) "
+            f"+ solde N-1 reporté · Total encaissé : {format_eur(total_year)}"
+        )
 
 
 def page_depenses(conn: sqlite3.Connection) -> None:
     st.subheader("Dépenses")
-    with st.form("add_expense", clear_on_submit=True):
-        description = st.text_input("Description *").strip()
-        montant = st.number_input("Montant", min_value=0.01, value=1.0, step=1.0)
-        depense_date = st.date_input("Date", value=date.today())
-        submitted = st.form_submit_button("Ajouter")
-        if submitted:
-            if not description:
-                st.error("Description obligatoire.")
-            else:
-                conn.execute(
-                    "INSERT INTO depenses(description, montant, date) VALUES(?, ?, ?)",
-                    (description, float(montant), to_iso(depense_date)),
-                )
-                dep_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-                log_activity(
-                    conn,
-                    type_operation="CREATE",
-                    entite="depense",
-                    entite_id=int(dep_id),
-                    details=(
-                        f"Ajout depense #{int(dep_id)} "
-                        + fmt_depense_compact(description, float(montant), to_iso(depense_date))
-                    ),
-                )
-                conn.commit()
-                st.success("Dépense enregistrée.")
+    render_page_guide(
+        "1️⃣ Choisissez l'exercice &nbsp;→&nbsp; 2️⃣ Enregistrez une dépense à droite "
+        "ou sélectionnez une ligne pour la corriger."
+    )
 
-    year = st.number_input("Année des dépenses", min_value=2020, max_value=2100, value=date.today().year, step=1)
+    year = st.number_input(
+        "Exercice",
+        min_value=2020,
+        max_value=2100,
+        value=date.today().year,
+        step=1,
+        key="depenses_year",
+    )
+    year_int = int(year)
+    total_dep = total_expenses(conn, year_int)
+    nb_dep = conn.execute(
+        "SELECT COUNT(*) AS n FROM depenses WHERE strftime('%Y', date) = ?",
+        (str(year_int),),
+    ).fetchone()["n"]
+
+    k1, k2 = st.columns(2)
+    k1.metric("Dépenses enregistrées", int(nb_dep or 0))
+    k2.metric("Total (année)", format_eur(total_dep))
+
     dep = fetch_df(
         conn,
         """
@@ -1165,107 +1392,178 @@ def page_depenses(conn: sqlite3.Connection) -> None:
         WHERE strftime('%Y', date) = ?
         ORDER BY date DESC, id DESC;
         """,
-        (str(year),),
+        (str(year_int),),
     )
-    st.dataframe(dep, use_container_width=True)
-    st.metric("Total dépenses (année)", f"{total_expenses(conn, int(year)):.2f} EUR")
 
-    if not dep.empty:
-        st.markdown("### Corriger une dépense")
-        dep_options = {
-            f"id={int(r['id'])} | {r['date']} | {r['description']} | {float(r['montant']):.2f} EUR": int(r["id"])
-            for _, r in dep.iterrows()
-        }
-        selected_dep_label = st.selectbox("Dépense à corriger", list(dep_options.keys()))
-        selected_dep_id = dep_options[selected_dep_label]
-        dep_row = conn.execute(
-            "SELECT id, date, description, montant FROM depenses WHERE id = ?",
-            (selected_dep_id,),
-        ).fetchone()
-        if dep_row:
-            d1, d2, d3 = st.columns(3)
-            with d1:
-                edit_dep_desc = st.text_input(
-                    "Description (édition)",
-                    value=dep_row["description"] or "",
-                    key=f"edit_dep_desc_{selected_dep_id}",
-                )
-            with d2:
-                edit_dep_amount = st.number_input(
-                    "Montant (édition)",
-                    min_value=0.01,
-                    value=float(dep_row["montant"]),
-                    step=1.0,
-                    key=f"edit_dep_amount_{selected_dep_id}",
-                )
-            with d3:
-                edit_dep_date = st.date_input(
-                    "Date (édition)",
-                    value=datetime.fromisoformat(dep_row["date"]).date(),
-                    key=f"edit_dep_date_{selected_dep_id}",
-                )
+    search = st.text_input(
+        "Rechercher",
+        "",
+        key="depenses_search",
+        placeholder="Description, date…",
+    )
+    dep = filter_df_search(dep, search, ["description", "date"])
+    selected_dep_id: Optional[int] = None
 
-            x1, x2 = st.columns(2)
-            with x1:
-                if st.button("Mettre à jour la dépense", key=f"update_dep_{selected_dep_id}"):
-                    if not edit_dep_desc.strip():
+    col_list, col_form = st.columns([1.5, 1], gap="large")
+
+    with col_list:
+        st.markdown("##### Liste des dépenses")
+        if dep.empty:
+            st.info("Aucune dépense pour cet exercice.")
+            selected_dep_id = None
+        else:
+            st.caption(f"{len(dep)} ligne(s) — cliquez pour sélectionner.")
+            grid = dep.rename(
+                columns={"date": "Date", "description": "Description", "montant": "Montant (EUR)"}
+            ).drop(columns=["id"], errors="ignore")
+            id_by_row = dep["id"].astype(int).tolist()
+
+            selection = st.dataframe(
+                grid,
+                use_container_width=True,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="depenses_grid",
+                column_config={
+                    "Montant (EUR)": st.column_config.NumberColumn(format="%.2f EUR"),
+                },
+            )
+            selected_rows = []
+            if selection is not None and hasattr(selection, "selection") and selection.selection:
+                selected_rows = list(selection.selection.rows or [])
+
+            if selected_rows and 0 <= selected_rows[0] < len(id_by_row):
+                st.session_state["depense_selected_id"] = id_by_row[selected_rows[0]]
+            elif id_by_row:
+                if st.session_state.get("depense_selected_id") not in id_by_row:
+                    st.session_state["depense_selected_id"] = id_by_row[0]
+
+            dep_options = {
+                f"{r['date']} · {r['description']} · {float(r['montant']):.2f} EUR": int(r["id"])
+                for _, r in dep.iterrows()
+            }
+            dep_labels = list(dep_options.keys())
+            current_dep = st.session_state.get("depense_selected_id", id_by_row[0] if id_by_row else None)
+            if current_dep is not None and dep_labels:
+                dep_idx = next(
+                    (i for i, lbl in enumerate(dep_labels) if dep_options[lbl] == current_dep),
+                    0,
+                )
+                picked_dep = st.selectbox("Ligne sélectionnée", dep_labels, index=dep_idx)
+                selected_dep_id = dep_options[picked_dep]
+                st.session_state["depense_selected_id"] = selected_dep_id
+            else:
+                selected_dep_id = None
+
+    with col_form:
+        with st.container(border=True):
+            st.markdown("##### Nouvelle dépense")
+            with st.form("add_expense", clear_on_submit=True):
+                description = st.text_input("Description *", placeholder="Ex. location salle, fournitures…")
+                montant = st.number_input("Montant (EUR)", min_value=0.01, value=10.0, step=1.0)
+                depense_date = st.date_input("Date", value=date.today())
+                if st.form_submit_button("Enregistrer", type="primary", use_container_width=True):
+                    if not description.strip():
                         st.error("Description obligatoire.")
                     else:
-                        before = fmt_depense_compact(
-                            dep_row["description"] or "",
-                            float(dep_row["montant"]),
-                            str(dep_row["date"]),
-                        )
-                        conn.execute(
-                            """
-                            UPDATE depenses
-                            SET description = ?, montant = ?, date = ?
-                            WHERE id = ?
-                            """,
-                            (
-                                edit_dep_desc.strip(),
-                                float(edit_dep_amount),
-                                to_iso(edit_dep_date),
-                                selected_dep_id,
-                            ),
-                        )
-                        after = fmt_depense_compact(
-                            edit_dep_desc.strip(),
-                            float(edit_dep_amount),
-                            to_iso(edit_dep_date),
-                        )
-                        log_activity(
-                            conn,
-                            type_operation="UPDATE",
-                            entite="depense",
-                            entite_id=selected_dep_id,
-                            details=f"Maj depense #{selected_dep_id} {before}  ->  {after}",
-                        )
-                        conn.commit()
-                        st.success("Dépense mise à jour.")
-            with x2:
-                if st.button("Supprimer la dépense", type="secondary", key=f"delete_dep_{selected_dep_id}"):
-                    conn.execute("DELETE FROM depenses WHERE id = ?", (selected_dep_id,))
-                    log_activity(
-                        conn,
-                        type_operation="DELETE",
-                        entite="depense",
-                        entite_id=selected_dep_id,
-                        details=f"Suppression depense #{selected_dep_id}",
+                        insert_depense(conn, description, float(montant), depense_date)
+                        st.toast("Dépense enregistrée.")
+                        st.rerun()
+
+        if dep.empty:
+            pass
+        elif selected_dep_id is not None:
+            with st.container(border=True):
+                st.markdown("##### Modifier la sélection")
+                dep_row = conn.execute(
+                    "SELECT id, date, description, montant FROM depenses WHERE id = ?",
+                    (selected_dep_id,),
+                ).fetchone()
+                if dep_row:
+                    edit_dep_desc = st.text_input(
+                        "Description",
+                        value=dep_row["description"] or "",
+                        key=f"edit_dep_desc_{selected_dep_id}",
                     )
-                    conn.commit()
-                    st.success("Dépense supprimée.")
+                    edit_dep_amount = st.number_input(
+                        "Montant (EUR)",
+                        min_value=0.01,
+                        value=float(dep_row["montant"]),
+                        step=1.0,
+                        key=f"edit_dep_amount_{selected_dep_id}",
+                    )
+                    edit_dep_date = st.date_input(
+                        "Date",
+                        value=datetime.fromisoformat(dep_row["date"]).date(),
+                        key=f"edit_dep_date_{selected_dep_id}",
+                    )
+                    x1, x2 = st.columns(2)
+                    with x1:
+                        if st.button("Mettre à jour", key=f"update_dep_{selected_dep_id}", use_container_width=True):
+                            if not edit_dep_desc.strip():
+                                st.error("Description obligatoire.")
+                            else:
+                                before = fmt_depense_compact(
+                                    dep_row["description"] or "",
+                                    float(dep_row["montant"]),
+                                    str(dep_row["date"]),
+                                )
+                                conn.execute(
+                                    """
+                                    UPDATE depenses
+                                    SET description = ?, montant = ?, date = ?
+                                    WHERE id = ?
+                                    """,
+                                    (
+                                        edit_dep_desc.strip(),
+                                        float(edit_dep_amount),
+                                        to_iso(edit_dep_date),
+                                        selected_dep_id,
+                                    ),
+                                )
+                                after = fmt_depense_compact(
+                                    edit_dep_desc.strip(),
+                                    float(edit_dep_amount),
+                                    to_iso(edit_dep_date),
+                                )
+                                log_activity(
+                                    conn,
+                                    type_operation="UPDATE",
+                                    entite="depense",
+                                    entite_id=selected_dep_id,
+                                    details=f"Maj depense #{selected_dep_id} {before}  ->  {after}",
+                                )
+                                conn.commit()
+                                st.rerun()
+                    with x2:
+                        if st.button(
+                            "Supprimer",
+                            type="secondary",
+                            key=f"delete_dep_{selected_dep_id}",
+                            use_container_width=True,
+                        ):
+                            conn.execute("DELETE FROM depenses WHERE id = ?", (selected_dep_id,))
+                            log_activity(
+                                conn,
+                                type_operation="DELETE",
+                                entite="depense",
+                                entite_id=selected_dep_id,
+                                details=f"Suppression depense #{selected_dep_id}",
+                            )
+                            conn.commit()
+                            st.rerun()
 
 
 def page_dashboard(conn: sqlite3.Connection) -> None:
-    st.subheader("Dashboard")
-    st.caption("Vue d'ensemble financière de l'association.")
+    st.subheader("Tableau de bord")
+    render_page_guide("Vue d'ensemble de l'exercice : encaissements, dépenses et situation des membres.")
 
     head_l, head_r = st.columns([3, 1])
     with head_r:
         year = int(
             st.number_input(
-                "Année financière",
+                "Exercice",
                 min_value=2020,
                 max_value=2100,
                 value=date.today().year,
@@ -1288,33 +1586,35 @@ def page_dashboard(conn: sqlite3.Connection) -> None:
 
     st.divider()
 
-    k1, k2, k3, k4 = st.columns(4)
+    status_year = get_members_status(conn, year)
+    nb_late = int((status_year["statut"] == "En retard").sum()) if not status_year.empty else 0
+    nb_ok = len(status_year) - nb_late if not status_year.empty else 0
+
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric(
-        "Contributions",
-        f"{contrib:,.2f} EUR".replace(",", " "),
+        "Cotisations",
+        format_eur(contrib),
         delta=f"{(contrib - contrib_prev):+,.2f} EUR vs N-1".replace(",", " "),
     )
     k2.metric(
         "Dépenses",
-        f"{dep:,.2f} EUR".replace(",", " "),
+        format_eur(dep),
         delta=f"{(dep - dep_prev):+,.2f} EUR vs N-1".replace(",", " "),
         delta_color="inverse",
     )
-    k3.metric(
-        "Report N-1",
-        f"{report:,.2f} EUR".replace(",", " "),
-        help=f"Solde N-2 (rappel) : {report_n2:,.2f} EUR".replace(",", " "),
-    )
+    k3.metric("Report N-1", format_eur(report), help=f"Solde N-2 : {format_eur(report_n2)}")
     k4.metric(
         "Solde actuel",
-        f"{solde:,.2f} EUR".replace(",", " "),
+        format_eur(solde),
         delta=f"{(solde - solde_prev):+,.2f} EUR vs N-1".replace(",", " "),
     )
+    k5.metric("Membres à jour", nb_ok)
+    k6.metric("Membres en retard", nb_late)
 
     st.divider()
 
-    tab_apercu, tab_evolution, tab_parametres = st.tabs(
-        ["Vue d'ensemble", "Évolution mensuelle", "Paramètres"]
+    tab_apercu, tab_membres, tab_evolution, tab_parametres = st.tabs(
+        ["Vue d'ensemble", "Membres", "Évolution mensuelle", "Paramètres"]
     )
 
     with tab_apercu:
@@ -1421,6 +1721,31 @@ def page_dashboard(conn: sqlite3.Connection) -> None:
             ]
         )
         st.dataframe(synth, use_container_width=True, hide_index=True)
+
+    with tab_membres:
+        st.markdown("##### Situation des cotisations")
+        st.caption(
+            f"Pour enregistrer une cotisation, utilisez le menu **Cotisations**. "
+            f"Cotisation mensuelle : {MONTHLY_CONTRIBUTION:.0f} EUR."
+        )
+        if status_year.empty:
+            st.info("Aucun membre actif.")
+        else:
+            dash_search = st.text_input(
+                "Rechercher un membre",
+                "",
+                key="dashboard_member_search",
+                placeholder="Nom, référence…",
+            )
+            dash_view = filter_members_status(status_year, dash_search, only_late=False)
+            dash_view = sort_status_for_entry(dash_view)
+            st.dataframe(
+                status_grid_dataframe(dash_view),
+                use_container_width=True,
+                hide_index=True,
+            )
+            if nb_late > 0:
+                st.warning(f"{nb_late} membre(s) en retard sur l'exercice {year}.")
 
     with tab_evolution:
         st.markdown("##### Contributions et dépenses par mois")
@@ -1591,27 +1916,24 @@ def page_dashboard(conn: sqlite3.Connection) -> None:
 
 
 def page_activite(conn: sqlite3.Connection) -> None:
-    st.subheader("Activité")
-    st.caption("Trace des derniers mouvements : cotisations, dépenses et modifications.")
+    st.subheader("Journal d'activité")
+    render_page_guide("Historique des actions : cotisations, dépenses, modifications de fiches.")
 
-    f_lim, f_search = st.columns([1, 2])
+    f_lim, f_search, f_type = st.columns([1, 2, 1])
     with f_lim:
-        limit = st.selectbox(
-            "Nombre de derniers mouvements",
-            [10, 20, 50, 100, 200, 500],
-            index=2,
-            key="activity_limit",
-        )
+        limit = st.selectbox("Afficher les", [20, 50, 100, 200], index=1, key="activity_limit")
     with f_search:
-        search = (
-            st.text_input(
-                "Rechercher (membre, référence, détails)",
-                "",
-                key="activity_search",
-                placeholder="ex: M003, Diallo, cotisation…",
-            )
-            .strip()
-            .lower()
+        search = st.text_input(
+            "Rechercher",
+            "",
+            key="activity_search",
+            placeholder="Membre, référence, détail…",
+        )
+    with f_type:
+        type_filter = st.selectbox(
+            "Type",
+            ["Tous", "Cotisation", "Dépense", "Membre", "Import"],
+            key="activity_type_filter",
         )
 
     logs = fetch_df(
@@ -1642,23 +1964,32 @@ def page_activite(conn: sqlite3.Connection) -> None:
         (int(limit),),
     )
 
-    if search and not logs.empty:
-        mask = (
-            logs["nom_prenom"].astype(str).str.lower().str.contains(search, na=False)
-            | logs["details"].astype(str).str.lower().str.contains(search, na=False)
-            | logs["entite"].astype(str).str.lower().str.contains(search, na=False)
-        )
-        logs = logs[mask]
-        st.caption(f"{len(logs)} mouvement(s) correspondant(s).")
+    if not logs.empty:
+        logs["Type"] = logs["entite"].map(activity_entite_label)
+        type_map = {
+            "Cotisation": "contribution",
+            "Dépense": "depense",
+            "Membre": "membre",
+            "Import": "import_excel",
+        }
+        if type_filter != "Tous":
+            ent = type_map.get(type_filter, "")
+            logs = logs[logs["entite"] == ent]
+        logs = filter_df_search(logs, search, ["nom_prenom", "details", "Type"])
+        display = logs.rename(
+            columns={
+                "created_at": "Date",
+                "Type": "Type",
+                "nom_prenom": "Membre",
+                "details": "Détail",
+            }
+        )[["Date", "Type", "Membre", "Détail"]]
 
     if logs.empty:
-        st.info("Aucun mouvement enregistré pour le moment.")
+        st.info("Aucun mouvement pour ces critères.")
     else:
-        st.dataframe(
-            logs[["id", "created_at", "entite", "entite_id", "nom_prenom", "details"]],
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.caption(f"{len(display)} mouvement(s)")
+        st.dataframe(display, use_container_width=True, hide_index=True)
 
 
 # --- Import Excel (structure classeur AGPM Association) ---------------------------------
@@ -2276,27 +2607,33 @@ def ensure_openpyxl_or_stop() -> None:
 def page_import_excel(conn: sqlite3.Connection) -> None:
     st.subheader("Import Excel")
     ensure_openpyxl_or_stop()
-    st.caption(
-        "Feuilles attendues : « Cotisations AAAA » (en-tête membres ligne 4) et « Dépenses AAAA » "
-        "(en-tête ligne 3). Aperçu obligatoire avant écriture dans la base."
+    render_page_guide(
+        "Chargez votre classeur AGPM, vérifiez l'aperçu, complétez les téléphones si besoin, "
+        "puis enregistrez en base. Aucune écriture sans validation."
     )
 
-    up = st.file_uploader("Fichier Excel (.xlsx)", type=["xlsx"])
-    default_date_ins = st.date_input(
-        "Date d'inscription pour les nouveaux membres créés par l'import",
-        value=date(date.today().year, 1, 1),
-        key="import_default_inscription",
-    )
-    import_reports = st.checkbox(
-        "Importer les colonnes « Solde N-1 » / « Solde YYYY » (retard repris sur l'exercice ; "
-        "valeurs négatives Excel = montant dû positif)",
-        value=True,
-    )
     st.session_state.setdefault("_import_bundle", None)
 
+    with st.container(border=True):
+        st.markdown("##### Étape 1 — Fichier")
+        up = st.file_uploader("Classeur Excel (.xlsx)", type=["xlsx"], help="Ex. AGPM Association_2026.xlsx")
+
     if not up:
-        st.info("Chargez le classeur AGPM (ex. AGPM Association_2026.xlsx).")
+        st.info("📁 Déposez votre fichier Excel pour commencer.")
         return
+
+    with st.container(border=True):
+        st.markdown("##### Étape 2 — Options")
+        default_date_ins = st.date_input(
+            "Date d'inscription (nouveaux membres)",
+            value=date(date.today().year, 1, 1),
+            key="import_default_inscription",
+        )
+        import_reports = st.checkbox(
+            "Importer les soldes N-1 / Solde YYYY (retards reportés)",
+            value=True,
+            help="Valeurs négatives Excel = retard converti en montant dû.",
+        )
 
     raw = up.getvalue()
     try:
@@ -2319,7 +2656,8 @@ def page_import_excel(conn: sqlite3.Connection) -> None:
         default=sorted(depense_candidates),
     )
 
-    if st.button("Préparer l'aperçu", type="primary"):
+    st.markdown("##### Étape 3 — Feuilles et aperçu")
+    if st.button("Analyser le fichier et préparer l'aperçu", type="primary", use_container_width=True):
         try:
             bundle = parse_workbook_preview(
                 raw,
@@ -2357,7 +2695,8 @@ def page_import_excel(conn: sqlite3.Connection) -> None:
         )
     df_mem = pd.DataFrame(rows_mem)
 
-    st.markdown("### Contacts à importer — complétez les téléphones si besoin")
+    st.markdown("##### Étape 4 — Vérification des contacts")
+    st.caption("Complétez les téléphones manquants avant l'enregistrement définitif.")
     st.caption(
         "Sans numéro dans Excel, chaque ligne de cotisation reste une entrée distincte (homonymes non fusionnés). "
         "Renseignez le téléphone ci-dessous puis fusionnez les doublons, avant d'écrire en base."
@@ -2428,8 +2767,8 @@ def page_import_excel(conn: sqlite3.Connection) -> None:
             st.markdown(f"### Aperçu — reports membres ({len(rdf)} lignes)")
             st.dataframe(rdf.drop(columns=["member_uid"], errors="ignore").head(300), use_container_width=True)
 
-    st.markdown("### Validation")
-    if st.button("Écrire dans la base SQLite", type="primary"):
+    st.markdown("##### Étape 5 — Enregistrement")
+    if st.button("Valider et enregistrer dans la base", type="primary", use_container_width=True):
         try:
             sync_member_phones_from_editor(bundle, edited_mem)
             collapse_bundle_members_by_phone(bundle)
@@ -2456,28 +2795,41 @@ def page_import_excel(conn: sqlite3.Connection) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="AGPM - Gestion Association", layout="wide")
-    st.title("AGPM - Gestion de l'association")
-    st.caption("Cotisation mensuelle de référence: 10 EUR.")
+    st.set_page_config(
+        page_title="AGPM — Gestion association",
+        page_icon="🏛️",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    render_app_styles()
+    st.title("AGPM")
+    st.caption(f"Gestion des cotisations · {MONTHLY_CONTRIBUTION:.0f} EUR / mois · Données enregistrées en base")
 
     render_storage_sidebar()
     conn = get_conn()
 
     menu = st.sidebar.radio(
-        "Navigation",
-        ["Membres", "Contributions", "Dépenses", "Dashboard", "Activité", "Import Excel"],
+        "Menu",
+        [
+            "📋 Tableau de bord",
+            "👥 Membres",
+            "💶 Cotisations",
+            "📤 Dépenses",
+            "📜 Journal",
+            "📥 Import Excel",
+        ],
     )
-    st.sidebar.info("Les calculs sont basés sur les transactions réelles, pas sur des cellules Excel.")
+    st.sidebar.caption("Les montants et statuts sont calculés à partir des saisies réelles.")
 
-    if menu == "Membres":
+    if menu == "👥 Membres":
         page_membres(conn)
-    elif menu == "Contributions":
+    elif menu == "💶 Cotisations":
         page_contributions(conn)
-    elif menu == "Dépenses":
+    elif menu == "📤 Dépenses":
         page_depenses(conn)
-    elif menu == "Activité":
+    elif menu == "📜 Journal":
         page_activite(conn)
-    elif menu == "Import Excel":
+    elif menu == "📥 Import Excel":
         page_import_excel(conn)
     else:
         page_dashboard(conn)
