@@ -3,7 +3,8 @@ import json
 import re
 import sqlite3
 import unicodedata
-from datetime import date, datetime
+from pathlib import Path
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from typing import Any, Optional
 
@@ -23,7 +24,14 @@ from persistence import (
     restore_database_file,
 )
 
-MONTHLY_CONTRIBUTION = 10.0
+LOGO_PATH = Path(__file__).with_name("logo_agpm.png")
+
+DEFAULT_MONTHLY_CONTRIBUTION = 10.0
+
+MONTHS_FR = [
+    "Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
+    "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre",
+]
 
 
 def member_ref(member_id: int) -> str:
@@ -232,6 +240,14 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS parametres (
+            cle TEXT PRIMARY KEY,
+            valeur TEXT NOT NULL
+        );
+        """
+    )
     # Migration legere: ajoute un identifiant membre unique et stable.
     cols = [row["name"] for row in conn.execute("PRAGMA table_info(membres)").fetchall()]
     if "reference" not in cols:
@@ -269,6 +285,44 @@ def expected_months_for_member(inscription: date, year: int) -> int:
     if year > today.year:
         return 0
     return month_diff_inclusive(start, end)
+
+
+def first_sunday(year: int, month: int) -> date:
+    """Date de réunion = 1er dimanche du mois."""
+    d = date(year, month, 1)
+    # weekday(): lundi=0 … dimanche=6
+    return d + timedelta(days=(6 - d.weekday()) % 7)
+
+
+def get_monthly_contribution(conn: sqlite3.Connection) -> float:
+    row = conn.execute(
+        "SELECT valeur FROM parametres WHERE cle = 'montant_cotisation'"
+    ).fetchone()
+    if row and row["valeur"]:
+        try:
+            return float(row["valeur"])
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_MONTHLY_CONTRIBUTION
+
+
+def set_monthly_contribution(conn: sqlite3.Connection, amount: float) -> None:
+    conn.execute(
+        """
+        INSERT INTO parametres(cle, valeur)
+        VALUES('montant_cotisation', ?)
+        ON CONFLICT(cle) DO UPDATE SET valeur = excluded.valeur;
+        """,
+        (str(float(amount)),),
+    )
+    log_activity(
+        conn,
+        type_operation="UPDATE",
+        entite="parametres",
+        entite_id=None,
+        details=f"Montant cotisation mensuelle defini a {float(amount):.2f} EUR",
+    )
+    conn.commit()
 
 
 def get_association_report(conn: sqlite3.Connection, year: int) -> float:
@@ -422,11 +476,12 @@ def get_members_status(conn: sqlite3.Connection, year: int, include_archived: bo
     merged["solde_n1"] = merged["montant_du"].fillna(0.0)
     merged["date_inscription"] = pd.to_datetime(merged["date_inscription"], errors="coerce").dt.date
 
+    monthly_amount = get_monthly_contribution(conn)
     expected = []
     for _, row in merged.iterrows():
         inscription = row["date_inscription"] if pd.notna(row["date_inscription"]) else date(year, 1, 1)
         months = expected_months_for_member(inscription, year)
-        expected.append(months * MONTHLY_CONTRIBUTION + float(row["solde_n1"]))
+        expected.append(months * monthly_amount + float(row["solde_n1"]))
 
     merged["attendu"] = expected
     merged["reste"] = (merged["attendu"] - merged["total_paye"]).clip(lower=0)
@@ -636,6 +691,7 @@ def activity_entite_label(entite: str) -> str:
         "depense": "Dépense",
         "reports_membres": "Solde N-1 membre",
         "reports_association": "Solde association",
+        "parametres": "Paramètre",
         "import_excel": "Import Excel",
     }
     return labels.get(str(entite), str(entite))
@@ -1051,6 +1107,7 @@ def page_contributions(conn: sqlite3.Connection) -> None:
         help="Année prise en compte pour le statut et l'historique.",
     )
     year_int = int(year)
+    monthly_amount = get_monthly_contribution(conn)
 
     status_all = get_members_status(conn, year_int)
     if status_all.empty:
@@ -1160,7 +1217,7 @@ def page_contributions(conn: sqlite3.Connection) -> None:
             quick_col1, quick_col2 = st.columns(2)
             with quick_col1:
                 if st.button(
-                    f"+ {MONTHLY_CONTRIBUTION:.0f} EUR (aujourd'hui)",
+                    f"+ {monthly_amount:.0f} EUR (aujourd'hui)",
                     type="primary",
                     use_container_width=True,
                     key="contrib_quick_month",
@@ -1168,7 +1225,7 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                     insert_contribution(
                         conn,
                         selected_member_id,
-                        MONTHLY_CONTRIBUTION,
+                        monthly_amount,
                         date.today(),
                         "Cotisation mensuelle",
                     )
@@ -1190,12 +1247,74 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                     st.toast(f"Solde réglé pour {member_row['reference']}.")
                     st.rerun()
 
+            with st.expander("Régulariser plusieurs mois", expanded=False):
+                st.caption(
+                    "Sélectionnez les mois à payer. Chaque cotisation est datée au "
+                    "**1er dimanche** (jour de réunion) et vaut le montant mensuel."
+                )
+                paid_months = {
+                    int(m)
+                    for (m,) in conn.execute(
+                        """
+                        SELECT DISTINCT CAST(strftime('%m', date) AS INTEGER)
+                        FROM contributions
+                        WHERE membre_id = ? AND strftime('%Y', date) = ?
+                        """,
+                        (selected_member_id, str(year_int)),
+                    ).fetchall()
+                }
+
+                def _month_label(m: int) -> str:
+                    mark = " ✅" if m in paid_months else ""
+                    return f"{MONTHS_FR[m - 1]} ({first_sunday(year_int, m).strftime('%d/%m')}){mark}"
+
+                month_choices = {_month_label(m): m for m in range(1, 13)}
+                default_unpaid = [
+                    lbl for lbl, m in month_choices.items() if m not in paid_months
+                ]
+                with st.form("add_contribution_months", clear_on_submit=False):
+                    picked_months = st.multiselect(
+                        "Mois à régulariser",
+                        list(month_choices.keys()),
+                        help="✅ = au moins une cotisation déjà enregistrée ce mois.",
+                    )
+                    amount_per_month = st.number_input(
+                        "Montant par mois (EUR)",
+                        min_value=0.01,
+                        value=float(monthly_amount),
+                        step=1.0,
+                        key="contrib_months_amount",
+                    )
+                    nb_sel = len(picked_months)
+                    st.caption(
+                        f"{nb_sel} mois sélectionné(s) — total : "
+                        f"{format_eur(nb_sel * float(amount_per_month))}"
+                    )
+                    if st.form_submit_button(
+                        "Enregistrer les mois sélectionnés",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=nb_sel == 0,
+                    ):
+                        for lbl in picked_months:
+                            m = month_choices[lbl]
+                            reunion = first_sunday(year_int, m)
+                            insert_contribution(
+                                conn,
+                                selected_member_id,
+                                float(amount_per_month),
+                                reunion,
+                                f"Cotisation {MONTHS_FR[m - 1]} {year_int}",
+                            )
+                        st.toast(f"{nb_sel} mois enregistré(s) pour {member_row['reference']}.")
+                        st.rerun()
+
             with st.expander("Autre montant ou date", expanded=False):
                 with st.form("add_contribution_custom", clear_on_submit=True):
                     montant = st.number_input(
                         "Montant (EUR)",
                         min_value=0.01,
-                        value=MONTHLY_CONTRIBUTION,
+                        value=float(monthly_amount),
                         step=1.0,
                     )
                     contribution_date = st.date_input("Date", value=date.today())
@@ -1343,7 +1462,7 @@ def page_contributions(conn: sqlite3.Connection) -> None:
             all_hist = all_hist[mask]
         st.dataframe(all_hist, use_container_width=True, hide_index=True)
         st.caption(
-            f"Attendu par membre = {MONTHLY_CONTRIBUTION:.0f} EUR/mois (selon inscription) "
+            f"Attendu par membre = {monthly_amount:.0f} EUR/mois (selon inscription) "
             f"+ solde N-1 reporté · Total encaissé : {format_eur(total_year)}"
         )
 
@@ -1865,21 +1984,50 @@ def page_dashboard(conn: sqlite3.Connection) -> None:
         st.altair_chart(chart_cumul, use_container_width=True)
 
     with tab_parametres:
-        st.markdown("##### Solde reporté de l'association")
-        st.caption(
-            "Solde repris de l'année précédente vers l'exercice en cours. "
-            "Cette valeur alimente le KPI « Report N-1 » et le solde global."
-        )
-        new_report = st.number_input(
-            f"Solde reporté (N-1 → {year})",
-            value=float(report),
-            step=10.0,
-            key=f"dashboard_report_{year}",
-        )
-        if st.button("Enregistrer le solde reporté", type="primary"):
-            upsert_association_report(conn, year, float(new_report))
-            st.success("Solde reporté association enregistré.")
-            st.rerun()
+        col_p1, col_p2 = st.columns(2)
+
+        with col_p1:
+            with st.container(border=True):
+                st.markdown("##### Montant de la cotisation mensuelle")
+                st.caption(
+                    "Montant attendu par membre et par mois. Sert au calcul du statut "
+                    "et aux boutons d'enregistrement rapide."
+                )
+                current_amount = get_monthly_contribution(conn)
+                new_amount = st.number_input(
+                    "Montant mensuel (EUR)",
+                    min_value=0.01,
+                    value=float(current_amount),
+                    step=1.0,
+                    format="%.2f",
+                    key="settings_monthly_amount",
+                )
+                if st.button("Enregistrer le montant", type="primary", key="save_monthly_amount"):
+                    set_monthly_contribution(conn, float(new_amount))
+                    st.success(f"Cotisation mensuelle fixée à {format_eur(float(new_amount))}.")
+                    st.rerun()
+                st.caption(
+                    "ℹ️ Modifier le montant n'altère pas les cotisations déjà enregistrées ; "
+                    "cela change l'attendu pour le calcul des statuts."
+                )
+
+        with col_p2:
+            with st.container(border=True):
+                st.markdown("##### Solde reporté de l'association")
+                st.caption(
+                    "Solde repris de l'année précédente vers l'exercice en cours. "
+                    "Alimente le KPI « Report N-1 » et le solde global."
+                )
+                new_report = st.number_input(
+                    f"Solde reporté (N-1 → {year})",
+                    value=float(report),
+                    step=10.0,
+                    key=f"dashboard_report_{year}",
+                )
+                if st.button("Enregistrer le solde reporté", type="primary"):
+                    upsert_association_report(conn, year, float(new_report))
+                    st.success("Solde reporté association enregistré.")
+                    st.rerun()
 
 
 def page_activite(conn: sqlite3.Connection) -> None:
@@ -2762,18 +2910,31 @@ def page_import_excel(conn: sqlite3.Connection) -> None:
 
 
 def main() -> None:
+    has_logo = LOGO_PATH.is_file()
     st.set_page_config(
         page_title="AGPM — Gestion association",
-        page_icon="🏛️",
+        page_icon=str(LOGO_PATH) if has_logo else "🏛️",
         layout="wide",
         initial_sidebar_state="expanded",
     )
     render_app_styles()
-    st.title("AGPM")
-    st.caption(f"Gestion des cotisations · {MONTHLY_CONTRIBUTION:.0f} EUR / mois · Données enregistrées en base")
+
+    if has_logo:
+        st.sidebar.image(str(LOGO_PATH), use_container_width=True)
 
     render_storage_sidebar()
     conn = get_conn()
+
+    head_logo, head_text = st.columns([1, 5], vertical_alignment="center")
+    with head_logo:
+        if has_logo:
+            st.image(str(LOGO_PATH), use_container_width=True)
+    with head_text:
+        st.title("AGPM")
+        st.caption(
+            "Association des Guinéens du Pays de Meaux · "
+            f"Cotisation : {get_monthly_contribution(conn):.0f} EUR / mois"
+        )
 
     menu = st.sidebar.radio(
         "Menu",
