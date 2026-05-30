@@ -30,12 +30,6 @@ def member_ref(member_id: int) -> str:
     return f"M{int(member_id):03d}"
 
 
-def member_ref_label(reference: str, nom: str, prenom: str, village: str, telephone: str) -> str:
-    village_safe = (village or "").strip() or "-"
-    tel_safe = (telephone or "").strip() or "-"
-    return f"{reference} | {nom} {prenom} | {village_safe} | {tel_safe}"
-
-
 def fmt_v(value: object) -> str:
     """Formate une valeur pour les libellés d'activité ; renvoie '-' si vide/None."""
     if value is None:
@@ -595,10 +589,6 @@ def render_app_styles() -> None:
 
 def render_page_guide(text: str) -> None:
     st.markdown(f'<p class="page-guide">{text}</p>', unsafe_allow_html=True)
-
-
-def render_contributions_styles() -> None:
-    render_app_styles()
 
 
 def filter_df_search(df: pd.DataFrame, search: str, columns: list[str]) -> pd.DataFrame:
@@ -1618,84 +1608,63 @@ def page_dashboard(conn: sqlite3.Connection) -> None:
     )
 
     with tab_apercu:
-        col_left, col_right = st.columns(2)
-        with col_left:
-            st.markdown("##### Répartition de l'exercice")
-            breakdown = pd.DataFrame(
-                {
-                    "categorie": ["Report N-1", "Contributions", "Dépenses"],
-                    "montant": [report, contrib, dep],
-                }
-            )
-            color_scale_breakdown = alt.Scale(
-                domain=["Report N-1", "Contributions", "Dépenses"],
-                range=["#94a3b8", "#16a34a", "#ef4444"],
-            )
-            base_bd = alt.Chart(breakdown).encode(
-                y=alt.Y("categorie:N", sort=["Contributions", "Dépenses", "Report N-1"], title=None),
-                x=alt.X("montant:Q", title="Montant (EUR)", axis=alt.Axis(format=",.0f")),
-                color=alt.Color("categorie:N", scale=color_scale_breakdown, legend=None),
-                tooltip=[
-                    alt.Tooltip("categorie:N", title="Catégorie"),
-                    alt.Tooltip("montant:Q", title="Montant", format=",.2f"),
-                ],
-            )
-            chart_bd = (
-                (
-                    base_bd.mark_bar(cornerRadiusEnd=4, height=28)
-                    + base_bd.mark_text(align="left", dx=6, color="#1f2937", fontWeight="bold").encode(
-                        text=alt.Text("montant:Q", format=",.2f")
-                    )
-                )
-                .properties(height=240)
-                .configure_view(strokeWidth=0)
-                .configure_axis(grid=False)
-            )
-            st.altair_chart(chart_bd, use_container_width=True)
+        st.markdown("##### Du report N-1 au solde actuel")
 
-        with col_right:
-            st.markdown("##### Construction du solde")
-            waterfall = pd.DataFrame(
-                {
-                    "etape": ["Report N-1", "Contributions", "Dépenses", "Solde"],
-                    "montant": [report, contrib, -dep, solde],
-                    "type": ["Report", "Apport", "Sortie", "Solde"],
-                }
-            )
-            color_scale_wf = alt.Scale(
-                domain=["Report", "Apport", "Sortie", "Solde"],
-                range=["#94a3b8", "#16a34a", "#ef4444", "#2563eb"],
-            )
-            base_wf = alt.Chart(waterfall).encode(
-                x=alt.X(
-                    "etape:N",
-                    sort=["Report N-1", "Contributions", "Dépenses", "Solde"],
-                    title=None,
-                    axis=alt.Axis(labelAngle=0),
-                ),
-                y=alt.Y("montant:Q", title="Montant (EUR)", axis=alt.Axis(format=",.0f")),
-                color=alt.Color("type:N", scale=color_scale_wf, legend=None),
-                tooltip=[
-                    alt.Tooltip("etape:N", title="Étape"),
-                    alt.Tooltip("montant:Q", title="Montant", format=",.2f"),
-                ],
-            )
-            chart_wf = (
-                (
-                    base_wf.mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4, size=42)
-                    + base_wf.mark_text(
-                        align="center",
-                        baseline="bottom",
-                        dy=-4,
-                        color="#1f2937",
-                        fontWeight="bold",
-                    ).encode(text=alt.Text("montant:Q", format=",.2f"))
-                )
-                .properties(height=240)
-                .configure_view(strokeWidth=0)
-                .configure_axis(grid=False)
-            )
-            st.altair_chart(chart_wf, use_container_width=True)
+        steps = [
+            ("Report N-1", report, "Report"),
+            ("Contributions", contrib, "Apport"),
+            ("Dépenses", -dep, "Sortie"),
+            ("Solde actuel", solde, "Solde"),
+        ]
+        wf = pd.DataFrame(steps, columns=["etape", "delta", "type"])
+
+        running = 0.0
+        bases: list[float] = []
+        tops: list[float] = []
+        for _, r in wf.iterrows():
+            if r["type"] == "Solde":
+                bases.append(0.0)
+                tops.append(float(r["delta"]))
+            else:
+                start = running
+                running += float(r["delta"])
+                bases.append(min(start, running))
+                tops.append(max(start, running))
+        wf["base"] = bases
+        wf["top"] = tops
+
+        order = ["Report N-1", "Contributions", "Dépenses", "Solde actuel"]
+        color_scale_wf = alt.Scale(
+            domain=["Report", "Apport", "Sortie", "Solde"],
+            range=["#94a3b8", "#16a34a", "#ef4444", "#2563eb"],
+        )
+        base_wf = alt.Chart(wf).encode(
+            x=alt.X("etape:N", sort=order, title=None, axis=alt.Axis(labelAngle=0)),
+        )
+        bars_wf = base_wf.mark_bar(cornerRadius=5, size=58).encode(
+            y=alt.Y("base:Q", title="Montant (EUR)", axis=alt.Axis(format=",.0f")),
+            y2="top:Q",
+            color=alt.Color("type:N", scale=color_scale_wf, legend=None),
+            tooltip=[
+                alt.Tooltip("etape:N", title="Étape"),
+                alt.Tooltip("delta:Q", title="Montant", format="+,.2f"),
+            ],
+        )
+        labels_wf = base_wf.mark_text(dy=-8, color="#1f2937", fontWeight="bold").encode(
+            y="top:Q",
+            text=alt.Text("delta:Q", format="+,.0f"),
+        )
+        chart_wf = (
+            (bars_wf + labels_wf)
+            .properties(height=340)
+            .configure_view(strokeWidth=0)
+            .configure_axis(grid=True, gridOpacity=0.2)
+        )
+        st.altair_chart(chart_wf, use_container_width=True)
+        st.caption(
+            "Lecture de gauche à droite : on part du report N-1, on ajoute les cotisations (vert), "
+            "on retire les dépenses (rouge) → solde actuel (bleu)."
+        )
 
         st.markdown("##### Synthèse N / N-1")
         synth = pd.DataFrame(
@@ -1724,28 +1693,26 @@ def page_dashboard(conn: sqlite3.Connection) -> None:
 
     with tab_membres:
         st.markdown("##### Situation des cotisations")
-        st.caption(
-            f"Pour enregistrer une cotisation, utilisez le menu **Cotisations**. "
-            f"Cotisation mensuelle : {MONTHLY_CONTRIBUTION:.0f} EUR."
-        )
         if status_year.empty:
             st.info("Aucun membre actif.")
         else:
-            dash_search = st.text_input(
-                "Rechercher un membre",
-                "",
-                key="dashboard_member_search",
-                placeholder="Nom, référence…",
-            )
-            dash_view = filter_members_status(status_year, dash_search, only_late=False)
-            dash_view = sort_status_for_entry(dash_view)
-            st.dataframe(
-                status_grid_dataframe(dash_view),
-                use_container_width=True,
-                hide_index=True,
-            )
+            total_membres = len(status_year)
+            taux = (nb_ok / total_membres * 100) if total_membres else 0.0
+            attendu_total = float(status_year["attendu"].sum())
+            reste_total = float(status_year["reste"].sum())
+
+            mk1, mk2, mk3 = st.columns(3)
+            mk1.metric("Membres à jour", f"{nb_ok} / {total_membres}", help=f"{taux:.0f}% des membres actifs")
+            mk2.metric("En retard", nb_late)
+            mk3.metric("Reste à encaisser", format_eur(reste_total), help=f"Attendu total : {format_eur(attendu_total)}")
+
             if nb_late > 0:
-                st.warning(f"{nb_late} membre(s) en retard sur l'exercice {year}.")
+                st.warning(
+                    f"⏳ {nb_late} membre(s) en retard sur l'exercice {year} "
+                    f"— détail et encaissement dans le menu **Cotisations**."
+                )
+            else:
+                st.success(f"✅ Tous les membres sont à jour pour l'exercice {year}.")
 
     with tab_evolution:
         st.markdown("##### Contributions et dépenses par mois")
