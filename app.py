@@ -294,10 +294,26 @@ def first_sunday(year: int, month: int) -> date:
     return d + timedelta(days=(6 - d.weekday()) % 7)
 
 
+def ensure_parametres_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS parametres (
+            cle TEXT PRIMARY KEY,
+            valeur TEXT NOT NULL
+        );
+        """
+    )
+
+
 def get_monthly_contribution(conn: sqlite3.Connection) -> float:
-    row = conn.execute(
-        "SELECT valeur FROM parametres WHERE cle = 'montant_cotisation'"
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT valeur FROM parametres WHERE cle = 'montant_cotisation'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        ensure_parametres_table(conn)
+        conn.commit()
+        return DEFAULT_MONTHLY_CONTRIBUTION
     if row and row["valeur"]:
         try:
             return float(row["valeur"])
@@ -307,6 +323,7 @@ def get_monthly_contribution(conn: sqlite3.Connection) -> float:
 
 
 def set_monthly_contribution(conn: sqlite3.Connection, amount: float) -> None:
+    ensure_parametres_table(conn)
     conn.execute(
         """
         INSERT INTO parametres(cle, valeur)
@@ -2925,15 +2942,16 @@ def main() -> None:
     render_storage_sidebar()
     conn = get_conn()
 
+    monthly_amount = get_monthly_contribution(conn)
     head_logo, head_text = st.columns([1, 5], vertical_alignment="center")
     with head_logo:
         if has_logo:
-            st.image(str(LOGO_PATH), use_container_width=True)
+            st.image(str(LOGO_PATH), width=130)
     with head_text:
         st.title("AGPM")
         st.caption(
             "Association des Guinéens du Pays de Meaux · "
-            f"Cotisation : {get_monthly_contribution(conn):.0f} EUR / mois"
+            f"Cotisation : {monthly_amount:.0f} EUR / mois"
         )
 
     menu = st.sidebar.radio(
