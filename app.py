@@ -3265,9 +3265,17 @@ def page_import_excel(conn: sqlite3.Connection) -> None:
 
 
 def get_app_password() -> Optional[str]:
+    pwd = None
     try:
         pwd = st.secrets.get("app_password")
-    except (FileNotFoundError, AttributeError):
+        if pwd is None:
+            for value in st.secrets.values():
+                if hasattr(value, "get"):
+                    nested = value.get("app_password")
+                    if nested:
+                        pwd = nested
+                        break
+    except Exception:
         pwd = None
     if pwd is None:
         pwd = os.environ.get("AGPM_APP_PASSWORD")
