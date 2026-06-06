@@ -1,8 +1,10 @@
 import calendar
 import json
+import os
 import re
 import sqlite3
 import unicodedata
+import urllib.parse
 from pathlib import Path
 from datetime import date, datetime, timedelta
 from io import BytesIO
@@ -714,6 +716,179 @@ def activity_entite_label(entite: str) -> str:
     return labels.get(str(entite), str(entite))
 
 
+def get_default_country_code(conn: sqlite3.Connection) -> str:
+    try:
+        row = conn.execute(
+            "SELECT valeur FROM parametres WHERE cle = 'indicatif_tel'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        ensure_parametres_table(conn)
+        conn.commit()
+        return "33"
+    if row and row["valeur"]:
+        digits = re.sub(r"\D", "", str(row["valeur"]))
+        if digits:
+            return digits
+    return "33"
+
+
+def set_default_country_code(conn: sqlite3.Connection, code: str) -> None:
+    ensure_parametres_table(conn)
+    digits = re.sub(r"\D", "", str(code)) or "33"
+    conn.execute(
+        """
+        INSERT INTO parametres(cle, valeur)
+        VALUES('indicatif_tel', ?)
+        ON CONFLICT(cle) DO UPDATE SET valeur = excluded.valeur;
+        """,
+        (digits,),
+    )
+    conn.commit()
+
+
+def phone_to_intl(phone: object, country_code: str) -> str:
+    """Convertit un numéro local en format international (chiffres uniquement)."""
+    digits = re.sub(r"\D", "", str(phone or ""))
+    if not digits:
+        return ""
+    cc = re.sub(r"\D", "", country_code) or "33"
+    if digits.startswith("00"):
+        return digits[2:]
+    if digits.startswith(cc):
+        return digits
+    digits = digits.lstrip("0")
+    return cc + digits
+
+
+def whatsapp_link(phone: object, message: str, country_code: str) -> str:
+    intl = phone_to_intl(phone, country_code)
+    if not intl:
+        return ""
+    return f"https://wa.me/{intl}?text={urllib.parse.quote(message)}"
+
+
+def mailto_link(email: object, subject: str, body: str) -> str:
+    addr = str(email or "").strip()
+    if not addr or "@" not in addr:
+        return ""
+    query = urllib.parse.urlencode({"subject": subject, "body": body})
+    return f"mailto:{addr}?{query}"
+
+
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
+def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Export") -> bytes:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+    return buf.getvalue()
+
+
+def render_export_buttons(df: pd.DataFrame, basename: str, key: str) -> None:
+    if df.empty:
+        return
+    today = date.today().isoformat()
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "⬇️ CSV",
+            data=df_to_csv_bytes(df),
+            file_name=f"{basename}_{today}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key=f"{key}_csv",
+        )
+    with c2:
+        st.download_button(
+            "⬇️ Excel",
+            data=df_to_excel_bytes(df),
+            file_name=f"{basename}_{today}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key=f"{key}_xlsx",
+        )
+
+
+def build_receipt_pdf(
+    *,
+    reference: str,
+    nom: str,
+    prenom: str,
+    montant: float,
+    date_paiement: str,
+    note: str,
+    annee: int,
+    total_paye_annee: float,
+    reste_annee: float,
+) -> Optional[bytes]:
+    """Génère un reçu PDF. Renvoie None si fpdf2 n'est pas installé."""
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        return None
+
+    pdf = FPDF(format="A4")
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    if LOGO_PATH.is_file():
+        try:
+            pdf.image(str(LOGO_PATH), x=15, y=12, w=38)
+        except Exception:
+            pass
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_xy(60, 16)
+    pdf.cell(0, 8, "AGPM", ln=1)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_x(60)
+    pdf.cell(0, 6, "Association des Guineens du Pays de Meaux", ln=1)
+
+    pdf.ln(18)
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 10, "RECU DE COTISATION", ln=1, align="C")
+    pdf.set_draw_color(37, 99, 235)
+    pdf.set_line_width(0.6)
+    y = pdf.get_y()
+    pdf.line(15, y, 195, y)
+    pdf.ln(8)
+
+    def _safe(txt: str) -> str:
+        return str(txt).encode("latin-1", "replace").decode("latin-1")
+
+    rows = [
+        ("Membre", f"{reference} - {nom} {prenom}"),
+        ("Date du paiement", date_paiement),
+        ("Montant recu", f"{montant:.2f} EUR"),
+        ("Objet", note or "Cotisation"),
+        ("Exercice", str(annee)),
+        ("Total paye (annee)", f"{total_paye_annee:.2f} EUR"),
+        ("Reste du (annee)", f"{reste_annee:.2f} EUR"),
+    ]
+    pdf.set_font("Helvetica", "", 11)
+    for label, value in rows:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(55, 9, _safe(label), border=0)
+        pdf.set_font("Helvetica", "", 11)
+        pdf.cell(0, 9, _safe(value), ln=1)
+
+    pdf.ln(12)
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.multi_cell(
+        0,
+        5,
+        _safe(
+            f"Recu emis le {date.today().strftime('%d/%m/%Y')} par l'application de gestion AGPM. "
+            "Document a conserver comme preuve de paiement."
+        ),
+    )
+
+    out = pdf.output()
+    return bytes(out)
+
+
 def _render_member_edit_panel(conn: sqlite3.Connection, selected_id: int) -> None:
     member_row = conn.execute(
         """
@@ -1141,6 +1316,70 @@ def page_contributions(conn: sqlite3.Connection) -> None:
     k3.metric("En retard", nb_late)
     k4.metric("Encaissé (année)", format_eur(total_year))
 
+    if nb_late > 0:
+        with st.expander(f"📣 Relancer les retardataires ({nb_late})", expanded=False):
+            country_code = get_default_country_code(conn)
+            late_df = status_all[status_all["statut"] == "En retard"].copy()
+            default_msg = (
+                "Bonjour {prenom}, petit rappel amical : votre cotisation AGPM {annee} "
+                "presente un reste de {reste} EUR. Merci de regulariser lors de la prochaine reunion. "
+                "Cordialement, le bureau AGPM."
+            )
+            msg_template = st.text_area(
+                "Message de rappel",
+                value=default_msg,
+                help="Variables disponibles : {prenom}, {nom}, {reste}, {annee}.",
+                key="reminder_template",
+            )
+
+            def _msg_for(r: pd.Series) -> str:
+                try:
+                    return msg_template.format(
+                        prenom=r["prenom"],
+                        nom=r["nom"],
+                        reste=f"{float(r['reste']):.2f}",
+                        annee=year_int,
+                    )
+                except (KeyError, ValueError):
+                    return msg_template
+
+            rows = []
+            for _, r in late_df.iterrows():
+                message = _msg_for(r)
+                subject = f"Rappel cotisation AGPM {year_int}"
+                rows.append(
+                    {
+                        "Référence": r["reference"],
+                        "Nom": f"{r['nom']} {r['prenom']}",
+                        "Téléphone": r["telephone"] or "—",
+                        "Reste": float(r["reste"]),
+                        "WhatsApp": whatsapp_link(r["telephone"], message, country_code),
+                        "Email": mailto_link(r["email"], subject, message),
+                    }
+                )
+            reminders = pd.DataFrame(rows)
+
+            st.caption(
+                f"Indicatif téléphonique : +{country_code} "
+                "(modifiable dans Tableau de bord → Paramètres). "
+                "Cliquez sur un lien pour ouvrir WhatsApp ou l'email pré-rempli."
+            )
+            st.dataframe(
+                reminders,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Reste": st.column_config.NumberColumn(format="%.2f EUR"),
+                    "WhatsApp": st.column_config.LinkColumn("WhatsApp", display_text="Envoyer"),
+                    "Email": st.column_config.LinkColumn("Email", display_text="Écrire"),
+                },
+            )
+            render_export_buttons(
+                reminders.drop(columns=["WhatsApp", "Email"]),
+                f"retardataires_{year_int}",
+                key="export_reminders",
+            )
+
     f1, f2 = st.columns([3, 1])
     with f1:
         search = st.text_input(
@@ -1302,6 +1541,11 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                         step=1.0,
                         key="contrib_months_amount",
                     )
+                    force_dup_m = st.checkbox(
+                        "Autoriser les mois déjà réglés (doublons)",
+                        value=False,
+                        key="contrib_months_force",
+                    )
                     nb_sel = len(picked_months)
                     st.caption(
                         f"{nb_sel} mois sélectionné(s) — total : "
@@ -1313,8 +1557,10 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                         use_container_width=True,
                         disabled=nb_sel == 0,
                     ):
-                        for lbl in picked_months:
-                            m = month_choices[lbl]
+                        chosen = [month_choices[lbl] for lbl in picked_months]
+                        to_insert = [m for m in chosen if force_dup_m or m not in paid_months]
+                        skipped = [m for m in chosen if not force_dup_m and m in paid_months]
+                        for m in to_insert:
                             reunion = first_sunday(year_int, m)
                             insert_contribution(
                                 conn,
@@ -1323,8 +1569,17 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                                 reunion,
                                 f"Cotisation {MONTHS_FR[m - 1]} {year_int}",
                             )
-                        st.toast(f"{nb_sel} mois enregistré(s) pour {member_row['reference']}.")
-                        st.rerun()
+                        if skipped:
+                            noms = ", ".join(MONTHS_FR[m - 1] for m in skipped)
+                            st.warning(
+                                f"{len(skipped)} mois déjà réglé(s) ignoré(s) : {noms}. "
+                                "Cochez « Autoriser les doublons » pour forcer."
+                            )
+                        if to_insert:
+                            st.toast(
+                                f"{len(to_insert)} mois enregistré(s) pour {member_row['reference']}."
+                            )
+                            st.rerun()
 
             with st.expander("Autre montant ou date", expanded=False):
                 with st.form("add_contribution_custom", clear_on_submit=True):
@@ -1336,16 +1591,27 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                     )
                     contribution_date = st.date_input("Date", value=date.today())
                     note = st.text_input("Note (facultatif)", placeholder="Ex. virement, espèces…")
+                    force_dup_c = st.checkbox(
+                        "Enregistrer même si ce mois est déjà réglé",
+                        value=False,
+                        key="contrib_custom_force",
+                    )
                     if st.form_submit_button("Enregistrer", use_container_width=True):
-                        insert_contribution(
-                            conn,
-                            selected_member_id,
-                            float(montant),
-                            contribution_date,
-                            note,
-                        )
-                        st.success("Cotisation enregistrée.")
-                        st.rerun()
+                        if contribution_date.month in paid_months and not force_dup_c:
+                            st.warning(
+                                f"{MONTHS_FR[contribution_date.month - 1]} {year_int} a déjà une "
+                                "cotisation. Cochez la case pour confirmer le doublon."
+                            )
+                        else:
+                            insert_contribution(
+                                conn,
+                                selected_member_id,
+                                float(montant),
+                                contribution_date,
+                                note,
+                            )
+                            st.success("Cotisation enregistrée.")
+                            st.rerun()
 
     with col_table:
         st.markdown("##### Historique du membre")
@@ -1451,6 +1717,48 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                             st.success("Cotisation supprimée.")
                             st.rerun()
 
+            with st.expander("🧾 Reçu de paiement (PDF)", expanded=False):
+                receipt_options = {
+                    f"{r['date']} · {float(r['montant']):.2f} EUR · {(r['note'] or 'Cotisation')}": (
+                        int(r["id"]),
+                        str(r["date"]),
+                        float(r["montant"]),
+                        r["note"] or "",
+                    )
+                    for _, r in hist.iterrows()
+                }
+                receipt_label = st.selectbox(
+                    "Cotisation à justifier",
+                    list(receipt_options.keys()),
+                    key="receipt_pick",
+                )
+                _, r_date, r_montant, r_note = receipt_options[receipt_label]
+                pdf_bytes = build_receipt_pdf(
+                    reference=str(member_row["reference"]),
+                    nom=str(member_row["nom"]),
+                    prenom=str(member_row["prenom"]),
+                    montant=r_montant,
+                    date_paiement=r_date,
+                    note=r_note,
+                    annee=year_int,
+                    total_paye_annee=paye,
+                    reste_annee=reste,
+                )
+                if pdf_bytes is None:
+                    st.warning(
+                        "Le module de génération PDF n'est pas installé. "
+                        "Ajoutez `fpdf2` aux dépendances (requirements.txt)."
+                    )
+                else:
+                    st.download_button(
+                        "⬇️ Télécharger le reçu",
+                        data=pdf_bytes,
+                        file_name=f"recu_{member_row['reference']}_{r_date}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                        key="receipt_download",
+                    )
+
     with st.expander("Voir toutes les cotisations de l'exercice", expanded=False):
         all_hist = fetch_df(
             conn,
@@ -1482,6 +1790,17 @@ def page_contributions(conn: sqlite3.Connection) -> None:
             f"Attendu par membre = {monthly_amount:.0f} EUR/mois (selon inscription) "
             f"+ solde N-1 reporté · Total encaissé : {format_eur(total_year)}"
         )
+        st.divider()
+        st.markdown("**Exports pour archives / réunions**")
+        ce1, ce2 = st.columns(2)
+        with ce1:
+            st.caption("Cotisations de l'exercice")
+            render_export_buttons(all_hist, f"cotisations_{year_int}", key="export_contribs")
+        with ce2:
+            st.caption("Statut des membres")
+            render_export_buttons(
+                status_display_df(status_all), f"statut_membres_{year_int}", key="export_status"
+            )
 
 
 def page_depenses(conn: sqlite3.Connection) -> None:
@@ -1555,6 +1874,7 @@ def page_depenses(conn: sqlite3.Connection) -> None:
                     "Montant (EUR)": st.column_config.NumberColumn(format="%.2f EUR"),
                 },
             )
+            render_export_buttons(grid, f"depenses_{year_int}", key="export_depenses")
             selected_rows = []
             if selection is not None and hasattr(selection, "selection") and selection.selection:
                 selected_rows = list(selection.selection.rows or [])
@@ -2044,6 +2364,24 @@ def page_dashboard(conn: sqlite3.Connection) -> None:
                 if st.button("Enregistrer le solde reporté", type="primary"):
                     upsert_association_report(conn, year, float(new_report))
                     st.success("Solde reporté association enregistré.")
+                    st.rerun()
+
+        with col_p1:
+            with st.container(border=True):
+                st.markdown("##### Indicatif téléphonique (rappels)")
+                st.caption(
+                    "Utilisé pour générer les liens WhatsApp des retardataires. "
+                    "Ex. 33 pour la France, 224 pour la Guinée."
+                )
+                current_cc = get_default_country_code(conn)
+                new_cc = st.text_input(
+                    "Indicatif pays (sans +)",
+                    value=current_cc,
+                    key="settings_country_code",
+                )
+                if st.button("Enregistrer l'indicatif", key="save_country_code"):
+                    set_default_country_code(conn, new_cc)
+                    st.success(f"Indicatif fixé à +{get_default_country_code(conn)}.")
                     st.rerun()
 
 
@@ -2926,6 +3264,50 @@ def page_import_excel(conn: sqlite3.Connection) -> None:
             st.exception(e)
 
 
+def get_app_password() -> Optional[str]:
+    try:
+        pwd = st.secrets.get("app_password")
+    except (FileNotFoundError, AttributeError):
+        pwd = None
+    if pwd is None:
+        pwd = os.environ.get("AGPM_APP_PASSWORD")
+    pwd = (str(pwd).strip() if pwd is not None else "")
+    return pwd or None
+
+
+def check_password(has_logo: bool) -> bool:
+    if st.session_state.get("auth_ok"):
+        return True
+
+    expected = get_app_password()
+    if not expected:
+        st.error(
+            "🔒 Accès non configuré. Définissez un mot de passe dans les **Secrets** "
+            "de l'application (`app_password = \"…\"`) puis rechargez la page."
+        )
+        st.caption(
+            "Streamlit Cloud : Manage app → Settings → Secrets. "
+            "En local : `.streamlit/secrets.toml`."
+        )
+        return False
+
+    col = st.columns([1, 2, 1])[1]
+    with col:
+        if has_logo:
+            st.image(str(LOGO_PATH), use_container_width=True)
+        st.markdown("### Accès réservé")
+        st.caption("Cette application est protégée. Saisissez le mot de passe.")
+        with st.form("login_form"):
+            pwd = st.text_input("Mot de passe", type="password")
+            if st.form_submit_button("Se connecter", type="primary", use_container_width=True):
+                if pwd == expected:
+                    st.session_state["auth_ok"] = True
+                    st.rerun()
+                else:
+                    st.error("Mot de passe incorrect.")
+    return False
+
+
 def main() -> None:
     has_logo = LOGO_PATH.is_file()
     st.set_page_config(
@@ -2936,23 +3318,25 @@ def main() -> None:
     )
     render_app_styles()
 
+    if not check_password(has_logo):
+        st.stop()
+
     if has_logo:
         st.sidebar.image(str(LOGO_PATH), use_container_width=True)
+
+    if st.sidebar.button("Se déconnecter", use_container_width=True):
+        st.session_state.pop("auth_ok", None)
+        st.rerun()
 
     render_storage_sidebar()
     conn = get_conn()
 
     monthly_amount = get_monthly_contribution(conn)
-    head_logo, head_text = st.columns([1, 5], vertical_alignment="center")
-    with head_logo:
-        if has_logo:
-            st.image(str(LOGO_PATH), width=130)
-    with head_text:
-        st.title("AGPM")
-        st.caption(
-            "Association des Guinéens du Pays de Meaux · "
-            f"Cotisation : {monthly_amount:.0f} EUR / mois"
-        )
+    st.title("AGPM")
+    st.caption(
+        "Association des Guinéens du Pays de Meaux · "
+        f"Cotisation : {monthly_amount:.0f} EUR / mois"
+    )
 
     menu = st.sidebar.radio(
         "Menu",
