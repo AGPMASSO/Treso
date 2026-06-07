@@ -35,6 +35,9 @@ MONTHS_FR = [
     "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre",
 ]
 
+PAYMENT_METHODS = ["Espèces", "Virement"]
+DEFAULT_PAYMENT_METHOD = PAYMENT_METHODS[0]
+
 
 def member_ref(member_id: int) -> str:
     return f"M{int(member_id):03d}"
@@ -196,6 +199,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             montant REAL NOT NULL CHECK (montant > 0),
             date TEXT NOT NULL,
             note TEXT NOT NULL DEFAULT '',
+            mode_paiement TEXT NOT NULL DEFAULT 'Espèces',
             FOREIGN KEY(membre_id) REFERENCES membres(id) ON DELETE CASCADE
         );
         """
@@ -256,6 +260,11 @@ def init_db(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE membres ADD COLUMN reference TEXT;")
     if "village_origine" not in cols:
         conn.execute("ALTER TABLE membres ADD COLUMN village_origine TEXT NOT NULL DEFAULT '';")
+    contrib_cols = [row["name"] for row in conn.execute("PRAGMA table_info(contributions)").fetchall()]
+    if "mode_paiement" not in contrib_cols:
+        conn.execute(
+            "ALTER TABLE contributions ADD COLUMN mode_paiement TEXT NOT NULL DEFAULT 'Espèces';"
+        )
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_membres_reference ON membres(reference);")
     # Normalise toutes les references au format M007.
     conn.execute("UPDATE membres SET reference = printf('M%03d', id);")
@@ -619,10 +628,12 @@ def insert_contribution(
     montant: float,
     contribution_date: date,
     note: str = "",
+    mode_paiement: str = DEFAULT_PAYMENT_METHOD,
 ) -> int:
+    mode = mode_paiement if mode_paiement in PAYMENT_METHODS else DEFAULT_PAYMENT_METHOD
     cur = conn.execute(
-        "INSERT INTO contributions(membre_id, montant, date, note) VALUES(?, ?, ?, ?)",
-        (member_id, float(montant), to_iso(contribution_date), note.strip()),
+        "INSERT INTO contributions(membre_id, montant, date, note, mode_paiement) VALUES(?, ?, ?, ?, ?)",
+        (member_id, float(montant), to_iso(contribution_date), note.strip(), mode),
     )
     cid = int(cur.lastrowid)
     log_activity(
@@ -633,6 +644,7 @@ def insert_contribution(
         details=(
             f"Ajout cotisation #{cid} {member_ref(member_id)} "
             + fmt_contribution_compact(float(montant), to_iso(contribution_date), note)
+            + f" [{mode}]"
         ),
     )
     conn.commit()
@@ -822,6 +834,7 @@ def build_receipt_pdf(
     annee: int,
     total_paye_annee: float,
     reste_annee: float,
+    mode_paiement: str = DEFAULT_PAYMENT_METHOD,
 ) -> Optional[bytes]:
     """Génère un reçu PDF. Renvoie None si fpdf2 n'est pas installé."""
     try:
@@ -862,6 +875,7 @@ def build_receipt_pdf(
         ("Membre", f"{reference} - {nom} {prenom}"),
         ("Date du paiement", date_paiement),
         ("Montant recu", f"{montant:.2f} EUR"),
+        ("Mode de paiement", mode_paiement or DEFAULT_PAYMENT_METHOD),
         ("Objet", note or "Cotisation"),
         ("Exercice", str(annee)),
         ("Total paye (annee)", f"{total_paye_annee:.2f} EUR"),
@@ -1470,6 +1484,12 @@ def page_contributions(conn: sqlite3.Connection) -> None:
             m_c.metric("Reste", format_eur(reste))
 
             st.markdown("##### Enregistrement rapide")
+            quick_mode = st.radio(
+                "Mode de paiement",
+                PAYMENT_METHODS,
+                horizontal=True,
+                key="contrib_quick_mode",
+            )
             quick_col1, quick_col2 = st.columns(2)
             with quick_col1:
                 if st.button(
@@ -1484,6 +1504,7 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                         monthly_amount,
                         date.today(),
                         "Cotisation mensuelle",
+                        quick_mode,
                     )
                     st.toast(f"Cotisation enregistrée pour {member_row['reference']}.")
                     st.rerun()
@@ -1499,6 +1520,7 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                         reste,
                         date.today(),
                         "Règlement du solde",
+                        quick_mode,
                     )
                     st.toast(f"Solde réglé pour {member_row['reference']}.")
                     st.rerun()
@@ -1541,6 +1563,12 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                         step=1.0,
                         key="contrib_months_amount",
                     )
+                    mode_m = st.radio(
+                        "Mode de paiement",
+                        PAYMENT_METHODS,
+                        horizontal=True,
+                        key="contrib_months_mode",
+                    )
                     force_dup_m = st.checkbox(
                         "Autoriser les mois déjà réglés (doublons)",
                         value=False,
@@ -1568,6 +1596,7 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                                 float(amount_per_month),
                                 reunion,
                                 f"Cotisation {MONTHS_FR[m - 1]} {year_int}",
+                                mode_m,
                             )
                         if skipped:
                             noms = ", ".join(MONTHS_FR[m - 1] for m in skipped)
@@ -1590,7 +1619,13 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                         step=1.0,
                     )
                     contribution_date = st.date_input("Date", value=date.today())
-                    note = st.text_input("Note (facultatif)", placeholder="Ex. virement, espèces…")
+                    mode_c = st.radio(
+                        "Mode de paiement",
+                        PAYMENT_METHODS,
+                        horizontal=True,
+                        key="contrib_custom_mode",
+                    )
+                    note = st.text_input("Note (facultatif)", placeholder="Ex. chèque, mobile money…")
                     force_dup_c = st.checkbox(
                         "Enregistrer même si ce mois est déjà réglé",
                         value=False,
@@ -1609,6 +1644,7 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                                 float(montant),
                                 contribution_date,
                                 note,
+                                mode_c,
                             )
                             st.success("Cotisation enregistrée.")
                             st.rerun()
@@ -1618,7 +1654,7 @@ def page_contributions(conn: sqlite3.Connection) -> None:
         hist = fetch_df(
             conn,
             """
-            SELECT c.id, c.date, c.montant, c.note
+            SELECT c.id, c.date, c.montant, c.mode_paiement, c.note
             FROM contributions c
             WHERE strftime('%Y', c.date) = ?
               AND c.membre_id = ?
@@ -1636,6 +1672,7 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                 column_config={
                     "date": st.column_config.TextColumn("Date"),
                     "montant": st.column_config.NumberColumn("Montant", format="%.2f EUR"),
+                    "mode_paiement": st.column_config.TextColumn("Mode"),
                     "note": st.column_config.TextColumn("Note"),
                 },
             )
@@ -1652,7 +1689,7 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                 )
                 selected_id = row_options[selected_label]
                 row = conn.execute(
-                    "SELECT id, membre_id, montant, date, note FROM contributions WHERE id = ?",
+                    "SELECT id, membre_id, montant, date, note, mode_paiement FROM contributions WHERE id = ?",
                     (selected_id,),
                 ).fetchone()
                 if row:
@@ -1671,6 +1708,16 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                             key=f"edit_date_{selected_id}",
                         )
                     with e2:
+                        current_mode = row["mode_paiement"] or DEFAULT_PAYMENT_METHOD
+                        edit_mode = st.radio(
+                            "Mode de paiement",
+                            PAYMENT_METHODS,
+                            index=PAYMENT_METHODS.index(current_mode)
+                            if current_mode in PAYMENT_METHODS
+                            else 0,
+                            horizontal=True,
+                            key=f"edit_mode_{selected_id}",
+                        )
                         edit_note = st.text_input(
                             "Note",
                             value=row["note"] or "",
@@ -1681,18 +1728,24 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                         if st.button("Mettre à jour", key=f"update_contrib_{selected_id}"):
                             before = fmt_contribution_compact(
                                 float(row["montant"]), str(row["date"]), row["note"] or ""
-                            )
+                            ) + f" [{row['mode_paiement'] or DEFAULT_PAYMENT_METHOD}]"
                             conn.execute(
                                 """
                                 UPDATE contributions
-                                SET montant = ?, date = ?, note = ?
+                                SET montant = ?, date = ?, note = ?, mode_paiement = ?
                                 WHERE id = ?
                                 """,
-                                (float(edit_amount), to_iso(edit_date), edit_note.strip(), selected_id),
+                                (
+                                    float(edit_amount),
+                                    to_iso(edit_date),
+                                    edit_note.strip(),
+                                    edit_mode,
+                                    selected_id,
+                                ),
                             )
                             after = fmt_contribution_compact(
                                 float(edit_amount), to_iso(edit_date), edit_note.strip()
-                            )
+                            ) + f" [{edit_mode}]"
                             log_activity(
                                 conn,
                                 type_operation="UPDATE",
@@ -1724,6 +1777,7 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                         str(r["date"]),
                         float(r["montant"]),
                         r["note"] or "",
+                        r["mode_paiement"] or DEFAULT_PAYMENT_METHOD,
                     )
                     for _, r in hist.iterrows()
                 }
@@ -1732,7 +1786,7 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                     list(receipt_options.keys()),
                     key="receipt_pick",
                 )
-                _, r_date, r_montant, r_note = receipt_options[receipt_label]
+                _, r_date, r_montant, r_note, r_mode = receipt_options[receipt_label]
                 pdf_bytes = build_receipt_pdf(
                     reference=str(member_row["reference"]),
                     nom=str(member_row["nom"]),
@@ -1740,6 +1794,7 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                     montant=r_montant,
                     date_paiement=r_date,
                     note=r_note,
+                    mode_paiement=r_mode,
                     annee=year_int,
                     total_paye_annee=paye,
                     reste_annee=reste,
@@ -1763,7 +1818,7 @@ def page_contributions(conn: sqlite3.Connection) -> None:
         all_hist = fetch_df(
             conn,
             """
-            SELECT c.date, m.reference, m.nom, m.prenom, c.montant, c.note
+            SELECT c.date, m.reference, m.nom, m.prenom, c.montant, c.mode_paiement, c.note
             FROM contributions c
             JOIN membres m ON m.id = c.membre_id
             WHERE strftime('%Y', c.date) = ?
