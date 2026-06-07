@@ -1547,68 +1547,66 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                     return f"{MONTHS_FR[m - 1]} ({first_sunday(year_int, m).strftime('%d/%m')}){mark}"
 
                 month_choices = {_month_label(m): m for m in range(1, 13)}
-                default_unpaid = [
-                    lbl for lbl, m in month_choices.items() if m not in paid_months
-                ]
-                with st.form("add_contribution_months", clear_on_submit=False):
-                    picked_months = st.multiselect(
-                        "Mois à régulariser",
-                        list(month_choices.keys()),
-                        help="✅ = au moins une cotisation déjà enregistrée ce mois.",
-                    )
-                    amount_per_month = st.number_input(
-                        "Montant par mois (EUR)",
-                        min_value=0.01,
-                        value=float(monthly_amount),
-                        step=1.0,
-                        key="contrib_months_amount",
-                    )
-                    mode_m = st.radio(
-                        "Mode de paiement",
-                        PAYMENT_METHODS,
-                        horizontal=True,
-                        key="contrib_months_mode",
-                    )
-                    force_dup_m = st.checkbox(
-                        "Autoriser les mois déjà réglés (doublons)",
-                        value=False,
-                        key="contrib_months_force",
-                    )
-                    nb_sel = len(picked_months)
-                    st.caption(
-                        f"{nb_sel} mois sélectionné(s) — total : "
-                        f"{format_eur(nb_sel * float(amount_per_month))}"
-                    )
-                    if st.form_submit_button(
-                        "Enregistrer les mois sélectionnés",
-                        type="primary",
-                        use_container_width=True,
-                        disabled=nb_sel == 0,
-                    ):
-                        chosen = [month_choices[lbl] for lbl in picked_months]
-                        to_insert = [m for m in chosen if force_dup_m or m not in paid_months]
-                        skipped = [m for m in chosen if not force_dup_m and m in paid_months]
-                        for m in to_insert:
-                            reunion = first_sunday(year_int, m)
-                            insert_contribution(
-                                conn,
-                                selected_member_id,
-                                float(amount_per_month),
-                                reunion,
-                                f"Cotisation {MONTHS_FR[m - 1]} {year_int}",
-                                mode_m,
-                            )
-                        if skipped:
-                            noms = ", ".join(MONTHS_FR[m - 1] for m in skipped)
-                            st.warning(
-                                f"{len(skipped)} mois déjà réglé(s) ignoré(s) : {noms}. "
-                                "Cochez « Autoriser les doublons » pour forcer."
-                            )
-                        if to_insert:
-                            st.toast(
-                                f"{len(to_insert)} mois enregistré(s) pour {member_row['reference']}."
-                            )
-                            st.rerun()
+                picked_months = st.multiselect(
+                    "Mois à régulariser",
+                    list(month_choices.keys()),
+                    help="✅ = au moins une cotisation déjà enregistrée ce mois.",
+                    key="contrib_months_pick",
+                )
+                amount_per_month = st.number_input(
+                    "Montant par mois (EUR)",
+                    min_value=0.01,
+                    value=float(monthly_amount),
+                    step=1.0,
+                    key="contrib_months_amount",
+                )
+                mode_m = st.radio(
+                    "Mode de paiement",
+                    PAYMENT_METHODS,
+                    horizontal=True,
+                    key="contrib_months_mode",
+                )
+                force_dup_m = st.checkbox(
+                    "Autoriser les mois déjà réglés (doublons)",
+                    value=False,
+                    key="contrib_months_force",
+                )
+                nb_sel = len(picked_months)
+                st.caption(
+                    f"{nb_sel} mois sélectionné(s) — total : "
+                    f"{format_eur(nb_sel * float(amount_per_month))}"
+                )
+                if st.button(
+                    "Enregistrer les mois sélectionnés",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=nb_sel == 0,
+                    key="contrib_months_submit",
+                ):
+                    chosen = [month_choices[lbl] for lbl in picked_months]
+                    to_insert = [m for m in chosen if force_dup_m or m not in paid_months]
+                    skipped = [m for m in chosen if not force_dup_m and m in paid_months]
+                    for m in to_insert:
+                        reunion = first_sunday(year_int, m)
+                        insert_contribution(
+                            conn,
+                            selected_member_id,
+                            float(amount_per_month),
+                            reunion,
+                            f"Cotisation {MONTHS_FR[m - 1]} {year_int}",
+                            mode_m,
+                        )
+                    if skipped:
+                        noms = ", ".join(MONTHS_FR[m - 1] for m in skipped)
+                        st.warning(
+                            f"{len(skipped)} mois déjà réglé(s) ignoré(s) : {noms}. "
+                            "Cochez « Autoriser les doublons » pour forcer."
+                        )
+                    if to_insert:
+                        st.toast(
+                            f"{len(to_insert)} mois enregistré(s) pour {member_row['reference']}."
+                        )
+                        st.rerun()
 
             with st.expander("Autre montant ou date", expanded=False):
                 with st.form("add_contribution_custom", clear_on_submit=True):
