@@ -269,6 +269,34 @@ def init_db(conn: sqlite3.Connection) -> None:
     # Normalise toutes les references au format M007.
     conn.execute("UPDATE membres SET reference = printf('M%03d', id);")
     conn.commit()
+    # Migration report dynamique : purge unique des reports postérieurs à l'année de
+    # référence (devenus obsolètes, désormais recalculés depuis les cotisations).
+    already = conn.execute(
+        "SELECT valeur FROM parametres WHERE cle = 'reports_purged'"
+    ).fetchone()
+    if not already:
+        base = get_baseline_year(conn)
+        removed = conn.execute(
+            "DELETE FROM reports_membres WHERE annee > ?;", (base,)
+        ).rowcount
+        conn.execute(
+            """
+            INSERT INTO parametres(cle, valeur) VALUES('reports_purged', '1')
+            ON CONFLICT(cle) DO UPDATE SET valeur = excluded.valeur;
+            """
+        )
+        if removed:
+            log_activity(
+                conn,
+                type_operation="DELETE",
+                entite="reports_membres",
+                entite_id=None,
+                details=(
+                    f"Purge migration report dynamique : {removed} report(s) postérieur(s) "
+                    f"à {base} supprimé(s)."
+                ),
+            )
+        conn.commit()
 
 
 def to_iso(value: date | datetime) -> str:
@@ -445,6 +473,28 @@ def total_expenses(conn: sqlite3.Connection, year: Optional[int] = None) -> floa
     return float(row["total"])
 
 
+def get_baseline_year(conn: sqlite3.Connection) -> int:
+    """Premier exercice géré : ancre la dette initiale (Solde N-1 importé)."""
+    row = conn.execute("SELECT MIN(annee) AS y FROM reports_membres").fetchone()
+    if row and row["y"] is not None:
+        return int(row["y"])
+    row = conn.execute(
+        "SELECT MIN(CAST(strftime('%Y', date) AS INTEGER)) AS y FROM contributions"
+    ).fetchone()
+    if row and row["y"] is not None:
+        return int(row["y"])
+    return date.today().year
+
+
+def full_year_months(inscription: date, year: int) -> int:
+    """Mois dus sur l'année complète (Jan→Déc), pondérés par la date d'inscription."""
+    start = max(inscription, date(year, 1, 1))
+    end = date(year, 12, 31)
+    if start > end:
+        return 0
+    return month_diff_inclusive(start, end)
+
+
 def get_members_status(conn: sqlite3.Connection, year: int, include_archived: bool = False) -> pd.DataFrame:
     where_clause = "" if include_archived else "WHERE actif = 1"
     members = fetch_df(
@@ -458,81 +508,92 @@ def get_members_status(conn: sqlite3.Connection, year: int, include_archived: bo
         ORDER BY nom, prenom;
         """,
     )
+    cols_out = [
+        "id",
+        "reference",
+        "actif",
+        "nom",
+        "prenom",
+        "telephone",
+        "village_origine",
+        "email",
+        "solde_n1",
+        "total_paye",
+        "attendu",
+        "reste",
+        "statut",
+    ]
     if members.empty:
-        return pd.DataFrame(
-            columns=[
-                "id",
-                "reference",
-                "actif",
-                "nom",
-                "prenom",
-                "telephone",
-                "village_origine",
-                "email",
-                "solde_n1",
-                "total_paye",
-                "attendu",
-                "reste",
-                "statut",
-            ]
-        )
-
-    paid = fetch_df(
-        conn,
-        """
-        SELECT membre_id, COALESCE(SUM(montant), 0) AS total_paye
-        FROM contributions
-        WHERE strftime('%Y', date) = ?
-        GROUP BY membre_id;
-        """,
-        (str(year),),
-    )
-    carried = fetch_df(
-        conn,
-        """
-        SELECT membre_id, montant_du
-        FROM reports_membres
-        WHERE annee = ?;
-        """,
-        (year,),
-    )
-
-    merged = members.merge(paid, how="left", left_on="id", right_on="membre_id").merge(
-        carried, how="left", left_on="id", right_on="membre_id", suffixes=("", "_carry")
-    )
-    merged["total_paye"] = merged["total_paye"].fillna(0.0)
-    merged["solde_n1"] = merged["montant_du"].fillna(0.0)
-    merged["date_inscription"] = pd.to_datetime(merged["date_inscription"], errors="coerce").dt.date
+        return pd.DataFrame(columns=cols_out)
 
     monthly_amount = get_monthly_contribution(conn)
-    expected = []
-    for _, row in merged.iterrows():
-        inscription = row["date_inscription"] if pd.notna(row["date_inscription"]) else date(year, 1, 1)
-        months = expected_months_for_member(inscription, year)
-        expected.append(months * monthly_amount + float(row["solde_n1"]))
+    baseline_year = get_baseline_year(conn)
 
-    merged["attendu"] = expected
-    merged["reste"] = (merged["attendu"] - merged["total_paye"]).clip(lower=0)
-    merged["statut"] = merged["reste"].apply(lambda x: "A jour" if abs(x) < 0.001 else "En retard")
-    if "village_origine" not in merged.columns:
-        merged["village_origine"] = ""
-    return merged[
-        [
-            "id",
-            "reference",
-            "actif",
-            "nom",
-            "prenom",
-            "telephone",
-            "village_origine",
-            "email",
-            "solde_n1",
-            "total_paye",
-            "attendu",
-            "reste",
-            "statut",
-        ]
-    ]
+    # Dette initiale (arriérés d'avant le premier exercice géré), par membre.
+    baseline = fetch_df(
+        conn,
+        "SELECT membre_id, montant_du FROM reports_membres WHERE annee = ?;",
+        (baseline_year,),
+    )
+    baseline_map = {int(r["membre_id"]): float(r["montant_du"]) for _, r in baseline.iterrows()}
+
+    # Paiements par membre et par année : servent à dériver les reports.
+    paid_year = fetch_df(
+        conn,
+        """
+        SELECT membre_id,
+               CAST(strftime('%Y', date) AS INTEGER) AS annee,
+               COALESCE(SUM(montant), 0) AS paye
+        FROM contributions
+        GROUP BY membre_id, annee;
+        """,
+    )
+    paid_map = {
+        (int(r["membre_id"]), int(r["annee"])): float(r["paye"])
+        for _, r in paid_year.iterrows()
+    }
+
+    members["date_inscription"] = pd.to_datetime(members["date_inscription"], errors="coerce").dt.date
+
+    rows = []
+    for _, mem in members.iterrows():
+        mid = int(mem["id"])
+        inscription = mem["date_inscription"] if pd.notna(mem["date_inscription"]) else date(year, 1, 1)
+
+        # Report entrant = dette initiale + reliquats des exercices précédents.
+        # Pas de plancher : un trop-perçu se reporte en crédit (valeur négative).
+        if year < baseline_year:
+            carry_in = get_member_report(conn, mid, year)
+        else:
+            carry_in = baseline_map.get(mid, 0.0)
+            for k in range(baseline_year, year):
+                carry_in += full_year_months(inscription, k) * monthly_amount
+                carry_in -= paid_map.get((mid, k), 0.0)
+
+        total_paye = paid_map.get((mid, year), 0.0)
+        attendu = carry_in + expected_months_for_member(inscription, year) * monthly_amount
+        reste = attendu - total_paye
+        statut = "A jour" if reste <= 0.001 else "En retard"
+
+        rows.append(
+            {
+                "id": mid,
+                "reference": mem["reference"],
+                "actif": mem["actif"],
+                "nom": mem["nom"],
+                "prenom": mem["prenom"],
+                "telephone": mem["telephone"],
+                "village_origine": mem["village_origine"] if "village_origine" in mem else "",
+                "email": mem["email"],
+                "solde_n1": round(carry_in, 2),
+                "total_paye": round(total_paye, 2),
+                "attendu": round(attendu, 2),
+                "reste": round(reste, 2),
+                "statut": statut,
+            }
+        )
+
+    return pd.DataFrame(rows, columns=cols_out)
 
 
 def get_member_report(conn: sqlite3.Connection, member_id: int, year: int) -> float:
@@ -1000,18 +1061,15 @@ def _render_member_edit_panel(conn: sqlite3.Connection, selected_id: int) -> Non
                     st.success("Fiche membre mise à jour.")
                     st.rerun()
 
-        with st.expander("Solde N-1 (retard reporté)", expanded=False):
-            report_year = st.number_input(
-                "Exercice",
-                min_value=2020,
-                max_value=2100,
-                value=date.today().year,
-                step=1,
-                key=f"member_report_year_{selected_id}",
+        with st.expander("Dette initiale (Solde N-1)", expanded=False):
+            report_year = get_baseline_year(conn)
+            st.caption(
+                f"Arriérés repris **avant** le premier exercice géré ({report_year}). "
+                "Les exercices suivants sont recalculés automatiquement à partir des cotisations."
             )
             current_solde = get_member_report(conn, selected_id, int(report_year))
             new_solde = st.number_input(
-                f"Montant (EUR)",
+                f"Montant dû avant {report_year} (EUR)",
                 min_value=0.0,
                 value=float(current_solde),
                 step=1.0,
@@ -1146,17 +1204,11 @@ def page_membres(conn: sqlite3.Connection) -> None:
                             st.error("Impossible d'ajouter ce membre.")
 
     with tab_soldes:
+        init_year = get_baseline_year(conn)
         st.caption(
-            "Montant dû repris de l'année précédente (colonne « Solde N-1 » Excel). "
-            "Utilisé pour le statut des cotisations."
-        )
-        init_year = st.number_input(
-            "Exercice",
-            min_value=2020,
-            max_value=2100,
-            value=date.today().year,
-            step=1,
-            key="bulk_solde_n1_year",
+            f"Dette initiale par membre, reprise **avant** le premier exercice géré ({init_year}) "
+            "— colonne « Solde N-1 » de l'Excel. Les reports des années suivantes sont "
+            "recalculés automatiquement à partir des cotisations enregistrées."
         )
         init_members = fetch_df(
             conn,
@@ -1465,6 +1517,11 @@ def page_contributions(conn: sqlite3.Connection) -> None:
     solde_n1 = float(member_row["solde_n1"])
     statut_txt = str(member_row["statut"])
     statut_badge = "✅ À jour" if statut_txt == "A jour" else "⏳ En retard"
+    solde_n1_txt = (
+        f"Solde N-1 : {format_eur(solde_n1)}"
+        if solde_n1 >= -0.001
+        else f"Avance N-1 : {format_eur(-solde_n1)}"
+    )
 
     st.divider()
 
@@ -1475,13 +1532,16 @@ def page_contributions(conn: sqlite3.Connection) -> None:
             st.markdown(f"#### {member_row['reference']} — {member_row['nom']} {member_row['prenom']}")
             st.caption(
                 f"{statut_badge} · Village : {member_row['village_origine'] or '—'} · "
-                f"Solde N-1 : {format_eur(solde_n1)}"
+                f"{solde_n1_txt}"
             )
 
             m_a, m_b, m_c = st.columns(3)
             m_a.metric("Payé", format_eur(paye))
             m_b.metric("Attendu", format_eur(attendu))
-            m_c.metric("Reste", format_eur(reste))
+            if reste < -0.001:
+                m_c.metric("Avance", format_eur(-reste))
+            else:
+                m_c.metric("Reste", format_eur(reste))
 
             st.markdown("##### Enregistrement rapide")
             quick_mode = st.radio(
@@ -1547,11 +1607,12 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                     return f"{MONTHS_FR[m - 1]} ({first_sunday(year_int, m).strftime('%d/%m')}){mark}"
 
                 month_choices = {_month_label(m): m for m in range(1, 13)}
+                pick_nonce = st.session_state.get("contrib_months_nonce", 0)
                 picked_months = st.multiselect(
                     "Mois à régulariser",
                     list(month_choices.keys()),
                     help="✅ = au moins une cotisation déjà enregistrée ce mois.",
-                    key="contrib_months_pick",
+                    key=f"contrib_months_pick_{pick_nonce}",
                 )
                 amount_per_month = st.number_input(
                     "Montant par mois (EUR)",
@@ -1603,6 +1664,7 @@ def page_contributions(conn: sqlite3.Connection) -> None:
                             "Cochez « Autoriser les doublons » pour forcer."
                         )
                     if to_insert:
+                        st.session_state["contrib_months_nonce"] = pick_nonce + 1
                         st.toast(
                             f"{len(to_insert)} mois enregistré(s) pour {member_row['reference']}."
                         )
@@ -2207,13 +2269,18 @@ def page_dashboard(conn: sqlite3.Connection) -> None:
         else:
             total_membres = len(status_year)
             taux = (nb_ok / total_membres * 100) if total_membres else 0.0
-            attendu_total = float(status_year["attendu"].sum())
-            reste_total = float(status_year["reste"].sum())
+            attendu_total = float(status_year["attendu"].clip(lower=0).sum())
+            reste_total = float(status_year["reste"].clip(lower=0).sum())
+            credit_total = float((-status_year["reste"]).clip(lower=0).sum())
 
             mk1, mk2, mk3 = st.columns(3)
             mk1.metric("Membres à jour", f"{nb_ok} / {total_membres}", help=f"{taux:.0f}% des membres actifs")
             mk2.metric("En retard", nb_late)
-            mk3.metric("Reste à encaisser", format_eur(reste_total), help=f"Attendu total : {format_eur(attendu_total)}")
+            credit_help = (
+                f"Attendu total : {format_eur(attendu_total)}"
+                + (f" · Avances : {format_eur(credit_total)}" if credit_total > 0.001 else "")
+            )
+            mk3.metric("Reste à encaisser", format_eur(reste_total), help=credit_help)
 
             if nb_late > 0:
                 st.warning(
@@ -2435,6 +2502,40 @@ def page_dashboard(conn: sqlite3.Connection) -> None:
                 if st.button("Enregistrer l'indicatif", key="save_country_code"):
                     set_default_country_code(conn, new_cc)
                     st.success(f"Indicatif fixé à +{get_default_country_code(conn)}.")
+                    st.rerun()
+
+        with col_p2:
+            with st.container(border=True):
+                base_year = get_baseline_year(conn)
+                st.markdown("##### Reports obsolètes")
+                st.caption(
+                    f"Le report N-1 est recalculé automatiquement depuis {base_year}. "
+                    f"Les soldes figés postérieurs à {base_year} (ex. import) sont inutiles "
+                    "et peuvent être supprimés."
+                )
+                nb_obsolete = conn.execute(
+                    "SELECT COUNT(*) AS n FROM reports_membres WHERE annee > ?",
+                    (base_year,),
+                ).fetchone()["n"]
+                st.metric("Reports obsolètes en base", int(nb_obsolete or 0))
+                if st.button(
+                    "Nettoyer les reports obsolètes",
+                    type="primary",
+                    disabled=int(nb_obsolete or 0) == 0,
+                    key="purge_reports",
+                ):
+                    removed = conn.execute(
+                        "DELETE FROM reports_membres WHERE annee > ?;", (base_year,)
+                    ).rowcount
+                    log_activity(
+                        conn,
+                        type_operation="DELETE",
+                        entite="reports_membres",
+                        entite_id=None,
+                        details=f"Nettoyage manuel : {removed} report(s) postérieur(s) à {base_year}.",
+                    )
+                    conn.commit()
+                    st.success(f"{removed} report(s) obsolète(s) supprimé(s).")
                     st.rerun()
 
 
